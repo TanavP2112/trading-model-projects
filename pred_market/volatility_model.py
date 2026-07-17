@@ -19,29 +19,6 @@ AS channel (one free parameter K, fit empirically): order-flow-driven
 adverse-selection variance, scaling with the squared bid-ask spread and a
 concave function of trading volume (more informed flow => wider realized
 moves, but with diminishing returns to raw volume).
-
-IMPORTANT — what's exact vs. approximated here:
-  - The DR term (p(1-p)/tau) is exact, parameter-free, and requires only
-    data we already have in the panel (price, days_to_resolution).
-  - The AS term's functional FORM (K * nu(V) * s^2/4) is exact per the
-    paper's derivation. The specific concave nu(.) they found strongest
-    ("concave volume scaling") was not fully specified in the portion of
-    the paper reviewed here, so this module uses log1p(V) as a standard,
-    defensible concave choice -- treat this as an engineering choice, not
-    a claim of reproducing their exact fitted functional form.
-  - K is fit here via simple OLS on your own data (regressing realized
-    squared price moves, net of the DR term, on nu(V)*s^2/4). The paper
-    fits K via a monthly expanding-window procedure on ~880k Kalshi
-    contract-hours; a single-shot OLS on a smaller panel is a much
-    lower-power version of the same idea.
-  - Real bid-ask spread (s) is not in this project's default data panel
-    (data_fetcher.py currently pulls the price series only). If you don't
-    supply a spread column, this module falls back to DR-ONLY, which the
-    paper itself reports "already improves substantially" on generic
-    GARCH benchmarks -- so the fallback is still a real, defensible model,
-    just missing the second channel. See fetch_spread_series() below for
-    how to pull real spreads via the official SDK's get_spread()/
-    get_order_book() methods if you want the full DR-AS model.
 """
 
 import numpy as np
@@ -126,13 +103,6 @@ def structural_h2(p, tau, volume=None, spread=None, K: float = 0.0) -> np.ndarra
 
 def add_structural_vol(df: pd.DataFrame, K: float = 0.0,
                         volume_col: str = "volume", spread_col: str | None = None) -> pd.DataFrame:
-    """
-    Adds columns:
-      h2        -- one-step structural conditional variance forecast
-      h         -- structural conditional standard deviation (sqrt of h2)
-    to a panel that has 'price' and 'days_to_resolution' columns (and,
-    optionally, a spread column for the full DR-AS model).
-    """
     df = df.copy()
     volume = df[volume_col].values if (spread_col is not None and volume_col in df.columns) else None
     spread = df[spread_col].values if (spread_col is not None and spread_col in df.columns) else None
