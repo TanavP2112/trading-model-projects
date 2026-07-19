@@ -27,7 +27,7 @@ CLOB_PRICE_HISTORY_ENDPOINT = f"{CLOB_BASE}/prices-history"
 # ---------------------------------------------------------------------------
 FEE_RATE_BY_CATEGORY = {
     "crypto": 0.07,
-    "sports": 0.03,          # 0.05 for markets created after Jul 2026; kept configurable
+    "sports": 0.05,           # updated Jul 2026 (was 0.03 before)
     "finance": 0.04,
     "politics": 0.04,
     "mentions": 0.04,

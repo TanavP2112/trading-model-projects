@@ -10,10 +10,7 @@ Why: prediction-market prices are bounded in [0,1] and represent
 probabilities. A move from 0.50 -> 0.55 and a move from 0.95 -> 0.99 are
 NOT the same "amount" of information -- the second is a much bigger
 implied shift in confidence, even though it's a smaller raw price change.
-The logit transform is the standard way to make these moves comparable
-(it's the same trick used in Brier-score decompositions and betting-odds
-analysis), and it also stops signals from misbehaving near the [0,1]
-boundary.
+The logit transform is the standard way to make these moves comparable.
 """
 
 import numpy as np

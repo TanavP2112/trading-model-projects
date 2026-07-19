@@ -42,6 +42,10 @@ CANDIDATE_MIN_STRUCT_REV = 0.75   # here are ordinary z-critical-values -- BUT m
 # panel (see README) to land at roughly the same selectivity (~top 3%) for both -- if you
 # change lookback windows or move to real data, re-check panel['struct_*_signal'].abs()
 # .quantile([0.9,0.95,0.99]) rather than assuming these fixed numbers still make sense.
+CANDIDATE_MIN_STRUCT_MOM_GARCH = 1.50   # GARCH-combined variants -- placeholder values,
+CANDIDATE_MIN_STRUCT_REV_GARCH = 0.75   # RE-CHECK against their own empirical quantiles too
+# (the GARCH multiplier changes the denominator's scale, so there's no guarantee the DR-AS-only
+# thresholds above happen to still be well-calibrated for the GARCH-combined signal versions).
 BANKROLL = 100_000.0         # nominal bankroll for dollar-denominated reporting
 
 
@@ -67,7 +71,44 @@ def _first_candidate_per_market(df: pd.DataFrame, signal_col: str, min_abs: floa
     return cand.groupby("market_id", as_index=False).first()
 
 
-def build_candidates(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
+# Strategy -> (signal column, direction sign convention, fallback fixed threshold)
+_STRUCTURAL_STRATEGIES = {
+    "structural_momentum": ("struct_mom_signal", 1, 1.50),
+    "structural_reversal": ("struct_rev_signal", -1, 0.75),
+    "structural_momentum_garch": ("struct_mom_garch_signal", 1, 1.50),
+    "structural_reversal_garch": ("struct_rev_garch_signal", -1, 0.75),
+}
+ADAPTIVE_PERCENTILE = 97.0   # target selectivity: top ~3% of |signal| on TRAIN data
+
+
+def compute_adaptive_thresholds(df: pd.DataFrame, train_market_ids: set,
+                                 percentile: float = ADAPTIVE_PERCENTILE) -> dict:
+    """
+    Derive each structural strategy's candidate threshold from the ACTUAL
+    empirical distribution of that signal on TRAIN markets only (never test
+    -- this is a threshold-selection decision, and letting test data
+    influence it would be a subtle form of look-ahead leakage, same
+    discipline as K-fitting and Kelly calibration elsewhere in this file).
+
+    Falls back to the fixed reference value in _STRUCTURAL_STRATEGIES if a
+    signal has too few valid (finite, non-null) train observations to
+    compute a percentile reliably.
+    """
+    train_df = df[df["market_id"].isin(train_market_ids)]
+    thresholds = {}
+    for strategy, (col, _sign, fallback) in _STRUCTURAL_STRATEGIES.items():
+        if col not in train_df.columns:
+            thresholds[strategy] = fallback
+            continue
+        vals = train_df[col].replace([np.inf, -np.inf], np.nan).dropna().abs()
+        if len(vals) < 30:
+            thresholds[strategy] = fallback
+        else:
+            thresholds[strategy] = float(np.percentile(vals, percentile))
+    return thresholds
+
+
+def build_candidates(df: pd.DataFrame, strategy: str, adaptive_thresholds: dict | None = None) -> pd.DataFrame:
     df = df.copy()
     df["tradeable"] = (df["volume"] >= MIN_VOLUME_USD) & (df["days_to_resolution"] >= MIN_DAYS_TO_RESOLUTION)
 
@@ -79,14 +120,12 @@ def build_candidates(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
         cand = _first_candidate_per_market(df, "rev_signal", CANDIDATE_MIN_REV)
         cand["signal_value"] = cand["rev_signal"]
         cand["direction"] = -np.sign(cand["signal_value"]).astype(int)    # FADE the extension
-    elif strategy == "structural_momentum":
-        cand = _first_candidate_per_market(df, "struct_mom_signal", CANDIDATE_MIN_STRUCT_MOM)
-        cand["signal_value"] = cand["struct_mom_signal"]
-        cand["direction"] = np.sign(cand["signal_value"]).astype(int)     # bet WITH the move
-    elif strategy == "structural_reversal":
-        cand = _first_candidate_per_market(df, "struct_rev_signal", CANDIDATE_MIN_STRUCT_REV)
-        cand["signal_value"] = cand["struct_rev_signal"]
-        cand["direction"] = -np.sign(cand["signal_value"]).astype(int)    # FADE the extension
+    elif strategy in _STRUCTURAL_STRATEGIES:
+        col, sign, fallback = _STRUCTURAL_STRATEGIES[strategy]
+        min_abs = (adaptive_thresholds or {}).get(strategy, fallback)
+        cand = _first_candidate_per_market(df, col, min_abs)
+        cand["signal_value"] = cand[col]
+        cand["direction"] = (sign * np.sign(cand["signal_value"])).astype(int)
     else:
         raise ValueError(strategy)
 
@@ -96,6 +135,8 @@ def build_candidates(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
     cand["win"] = np.where(cand["direction"] == 1, cand["outcome"], 1 - cand["outcome"]).astype(int)
     cand["raw_edge"] = cand["win"] - cand["entry_price_for_bet"]
     return cand
+
+
 
 
 def train_test_split_by_market(df: pd.DataFrame, train_frac: float = 0.65):
@@ -119,12 +160,20 @@ def calibrate_on_train(train_cand: pd.DataFrame):
         bins = N_DECILES
 
     train_cand = train_cand.copy()
-    try:
-        train_cand["bucket"], bin_edges = pd.qcut(train_cand["signal_value"], bins,
-                                                    labels=False, retbins=True, duplicates="drop")
-    except ValueError:
-        train_cand["bucket"] = 0
-        bin_edges = np.array([-np.inf, np.inf])
+    signal = train_cand["signal_value"].replace([np.inf, -np.inf], np.nan)
+
+    bin_edges = np.array([-np.inf, np.inf])
+    if signal.notna().sum() >= 2:
+        try:
+            _, raw_edges = pd.qcut(signal, bins, retbins=True, duplicates="drop")
+            raw_edges = np.unique(raw_edges[np.isfinite(raw_edges)])
+            if len(raw_edges) >= 2:
+                bin_edges = raw_edges.copy()
+                bin_edges[0] = -np.inf   # extend outer edges so no real value falls outside
+                bin_edges[-1] = np.inf
+        except ValueError:
+            pass  # keep the [-inf, inf] single-bucket fallback
+    train_cand["bucket"] = pd.cut(signal, bins=bin_edges, labels=False, include_lowest=True)
 
     calib = {}
     for b, g in train_cand.groupby("bucket"):
@@ -135,27 +184,6 @@ def calibrate_on_train(train_cand: pd.DataFrame):
         kelly_full = q - (1 - q) * c / (1 - c)
         kelly_sized = max(kelly_full, 0.0) * KELLY_FRACTION
         kelly_sized = min(kelly_sized, MAX_POSITION_FRACTION)
-
-        # Statistical-significance guard: don't just require a minimum
-        # sample size -- require the estimated edge to be several
-        # standard errors away from breakeven. A decile that "looks"
-        # profitable with n=25 trades and no real underlying edge is
-        # exactly the kind of noise that blows up out-of-sample (this is
-        # the single most common way new quants fool themselves with a
-        # decile-bucketed backtest). Edge here is measured as win_rate
-        # minus the breakeven win rate implied by the price paid (c);
-        # a bet is only profitable in expectation if q > c.
-        #
-        # z > 2.0 is deliberately stricter than a naive "95% confidence"
-        # (z > 1.645) threshold: we are testing N_DECILES=10 buckets
-        # SIMULTANEOUSLY, so under the null of "no real edge anywhere"
-        # we'd still expect ~1 bucket in 10 to clear a lenient z > 1.28
-        # threshold by chance alone (multiple-comparisons problem). A
-        # properly Bonferroni-corrected threshold for 10 simultaneous
-        # tests at 95% overall confidence would be z > ~2.5-2.8; z > 2.0
-        # is a pragmatic middle ground for a demo, not a rigorous
-        # correction -- tighten this further before trusting it with
-        # real capital.
         se = np.sqrt(max(q * (1 - q), 1e-6) / max(n, 1))
         z_stat = (q - c) / se if se > 0 else 0.0
         if n < 15 or z_stat < 2.0:
@@ -171,7 +199,15 @@ def apply_calibration_to_test(test_cand: pd.DataFrame, bin_edges: np.ndarray, ca
     trades = []
     if len(bin_edges) < 2:
         return trades
-    buckets = pd.cut(test_cand["signal_value"], bins=bin_edges, labels=False, include_lowest=True)
+
+    signal = test_cand["signal_value"].replace([np.inf, -np.inf], np.nan)
+    try:
+        buckets = pd.cut(signal, bins=bin_edges, labels=False, include_lowest=True)
+    except ValueError as e:
+        print(f"  !! apply_calibration_to_test('{strategy}'): pd.cut failed ({e}); "
+              f"skipping this strategy's test trades. bin_edges={bin_edges}")
+        return trades
+
     for (_, row), bucket in zip(test_cand.iterrows(), buckets):
         info = calib.get(int(bucket), None) if pd.notna(bucket) else None
         frac = info["position_fraction"] if info else 0.0
@@ -193,10 +229,17 @@ def apply_calibration_to_test(test_cand: pd.DataFrame, bin_edges: np.ndarray, ca
     return trades
 
 
-def run_strategy(df: pd.DataFrame, strategy: str, train_frac: float = 0.65) -> list[Trade]:
-    cand = build_candidates(df, strategy)
+def run_strategy(df: pd.DataFrame, strategy: str, train_frac: float = 0.65,
+                  adaptive_percentile: float = ADAPTIVE_PERCENTILE):
     train_df, test_df = train_test_split_by_market(df, train_frac)
-    train_cand = cand[cand["market_id"].isin(set(train_df["market_id"]))]
+    train_ids = set(train_df["market_id"])
+
+    adaptive_thresholds = None
+    if strategy in _STRUCTURAL_STRATEGIES:
+        adaptive_thresholds = compute_adaptive_thresholds(df, train_ids, adaptive_percentile)
+
+    cand = build_candidates(df, strategy, adaptive_thresholds=adaptive_thresholds)
+    train_cand = cand[cand["market_id"].isin(train_ids)]
     test_cand = cand[cand["market_id"].isin(set(test_df["market_id"]))]
     bin_edges, calib = calibrate_on_train(train_cand)
     trades = apply_calibration_to_test(test_cand, bin_edges, calib, strategy, None)

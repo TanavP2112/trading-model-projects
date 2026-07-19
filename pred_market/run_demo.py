@@ -1,17 +1,21 @@
 """
-Run the full pipeline end-to-end on SYNTHETIC data to validate that
-everything fits together correctly, and to show what the report output
-looks like.
+Run the full pipeline end-to-end.
 
     python run_demo.py
 
-To run against REAL Polymarket history instead, replace the
-`simulate_market_panel(...)` call below with:
+Currently configured to pull REAL Polymarket history via the raw-REST
+fallback (data_fetcher.build_market_panel, "Path 2"). Swap to
+data_fetcher.build_market_panel_sdk(...) for the official-SDK path
+("Path 1"), or to synthetic_data.simulate_market_panel(...) to go back to
+the zero-network pipeline-validation demo -- everything downstream
+(signals, backtest, metrics) is identical regardless of data source.
 
-    from data_fetcher import build_market_panel
-    panel = build_market_panel(min_volume=50_000, max_markets=300)
-
-everything downstream (signals, backtest, metrics) is identical.
+NOTE: build_market_panel() (Path 2) does not produce a 'spread' column, so
+the AS (adverse-selection) channel of the structural volatility model will
+be inactive here (K fits to 0) -- you'll get the DR-only structural model,
+which is still a real, defensible model per the paper (see README), just
+missing the second channel. The GARCH-on-residuals layer works regardless,
+since it only needs h2 (always computed), not spread.
 """
 
 import numpy as np
@@ -20,7 +24,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from synthetic_data import simulate_market_panel
+from data_fetcher import build_market_panel
 from signals import add_signals, add_structural_signals
 from backtest import run_strategy, trades_to_frame, compute_metrics, train_test_split_by_market
 from config import RANDOM_SEED
@@ -30,10 +34,9 @@ pd.set_option("display.width", 120)
 
 def banner():
     print("=" * 78)
-    print("  SYNTHETIC DATA DEMO -- validates pipeline mechanics only.")
-    print("  This does NOT demonstrate real edge on Polymarket.")
-    print("  Swap in data_fetcher.build_market_panel() for real history before")
-    print("  drawing ANY conclusion about live tradeability.")
+    print("  REAL POLYMARKET DATA RUN (Path 2 / raw REST fallback)")
+    print("  Results here reflect actual historical Polymarket markets --")
+    print("  still read every caveat in the README before trusting a Sharpe number.")
     print("=" * 78)
 
 
@@ -56,8 +59,27 @@ def print_metrics(name: str, m: dict):
 def main():
     banner()
 
-    print("\n[1/4] Simulating synthetic resolved-market panel...")
-    panel = simulate_market_panel(n_markets=3500, seed=RANDOM_SEED)
+    print("\n[1/4] Fetching real resolved Polymarket markets...")
+    # build_market_panel() now has its own built-in checkpointing/resume
+    # logic (checkpoint_path below) -- it saves progress every
+    # checkpoint_every markets, and on a fresh call, skips any market_id
+    # already present in that file. This subsumes the separate cache-check
+    # wrapper that used to live here: if CACHE_PATH already has everything
+    # you asked for, the resume logic sees that on its very first iteration
+    # and returns almost instantly; if it's a full fresh start, there's
+    # nothing to skip and it behaves like a normal fetch; if a previous run
+    # crashed partway through (this is what motivated adding this at all --
+    # a real ConnectionTerminated error lost 43 minutes of progress at
+    # 1300/1500 markets with no checkpointing), it picks up from wherever
+    # it stopped instead of starting over.
+    CACHE_PATH = "data/real_panel_cache.parquet"
+    panel = build_market_panel(min_volume=10_000, max_markets=1350,
+                                checkpoint_path=CACHE_PATH, checkpoint_every=50, max_retries=5)
+    if panel.empty:
+        print("      Got 0 markets/rows back. Stopping here -- fix the fetch before")
+        print("      going any further (see diagnose_fetch.py / the README's smoke-test")
+        print("      instructions). No point running signals/backtest on empty data.")
+        return
     print(f"      {panel['market_id'].nunique()} markets, {len(panel)} total price bars")
 
     print("[2/4] Computing logit-scale momentum & reversal signals...")
@@ -65,12 +87,16 @@ def main():
 
     print("      Fitting DR-AS structural volatility model (K fit on train markets only)...")
     train_df_for_fit, _ = train_test_split_by_market(panel)
+    # spread_col="spread" is harmless to pass even though build_market_panel()
+    # doesn't produce one -- add_structural_signals checks for the column's
+    # presence and falls back to DR-only (K=0) rather than erroring. See the
+    # module docstring at the top of this file.
     panel, fitted_K = add_structural_signals(
         panel, train_market_ids=set(train_df_for_fit["market_id"]),
-        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread",
+        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread"
     )
     print(f"      Fitted AS-channel scale K = {fitted_K:.4f} "
-          f"(K=0 would mean DR-only; synthetic data includes a spread column so both channels are active)")
+          f"(expected 0.0 here -- no spread column from Path 2, so this is DR-only)")
 
     print("[3/4] Running backtests (train/test split by market start date, 65/35)...")
     mom_trades, mom_calib = run_strategy(panel, "momentum")
@@ -96,7 +122,7 @@ def main():
     print_metrics("REVERSAL strategy (naive rolling z-score)", rev_metrics)
     print_metrics("STRUCTURAL MOMENTUM (DR-AS vol-normalized)", smom_metrics)
     print_metrics("STRUCTURAL REVERSAL (DR-AS vol-normalized)", srev_metrics)
-    print_metrics("COMBINED portfolio (all four)", combined_metrics)
+    print_metrics("COMBINED portfolio (all six)", combined_metrics)
 
     print("\n--- Train-set calibration tables (frozen before touching test set) ---")
     for name, calib in [("momentum", mom_calib), ("reversal", rev_calib),
@@ -109,15 +135,14 @@ def main():
     # --- Save outputs (clear stale files first -- a strategy producing 0
     # trades this run should not leave behind a CSV from a previous run) ---
     import os
-    for fname in ["results/momentum_trades.csv", "results/reversal_trades.csv",
-                  "results/structural_momentum_trades.csv", "results/structural_reversal_trades.csv"]:
+    all_trade_files = ["results/momentum_trades.csv", "results/reversal_trades.csv",
+                       "results/structural_momentum_trades.csv", "results/structural_reversal_trades.csv",
+                       "results/structural_momentum_garch_trades.csv", "results/structural_reversal_garch_trades.csv"]
+    for fname in all_trade_files:
         if os.path.exists(fname):
             os.remove(fname)
     written = []
-    for fname, d in [("results/momentum_trades.csv", mom_df),
-                     ("results/reversal_trades.csv", rev_df),
-                     ("results/structural_momentum_trades.csv", smom_df),
-                     ("results/structural_reversal_trades.csv", srev_df)]:
+    for fname, d in zip(all_trade_files, [mom_df, rev_df, smom_df, srev_df]):
         if not d.empty:
             d.to_csv(fname, index=False)
             written.append(fname)
@@ -131,9 +156,9 @@ def main():
         if m.get("n_trades", 0) > 0 and "equity_curve" in m:
             ax.plot(m["equity_curve"].index, m["equity_curve"].values, label=name, color=color, linewidth=1.6)
     ax.axhline(1.0, color="grey", linestyle="--", linewidth=0.8)
-    ax.set_title("Synthetic backtest equity curves (test set) -- illustrative only")
+    ax.set_title("Real Polymarket backtest equity curves (test set)")
     ax.set_ylabel("Equity (starting = 1.0)")
-    ax.legend()
+    ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig("results/equity_curves.png", dpi=140)
     written.append("results/equity_curves.png")
