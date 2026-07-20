@@ -61,8 +61,9 @@ EXPONENT_BY_CATEGORY = {
 }
 DEFAULT_EXPONENT = 1.0
 
-# Dollar fee for a taker order of `shares` contracts at `price`, in `category`
+
 def taker_fee(price: float, shares: float, category: str) -> float:
+    """Dollar fee for a taker order of `shares` contracts at `price`, in `category`."""
     rate = FEE_RATE_BY_CATEGORY.get(category, DEFAULT_FEE_RATE)
     exponent = EXPONENT_BY_CATEGORY.get(category, DEFAULT_EXPONENT)
     return shares * rate * (price * (1.0 - price)) ** exponent

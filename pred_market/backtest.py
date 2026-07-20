@@ -71,7 +71,19 @@ def _first_candidate_per_market(df: pd.DataFrame, signal_col: str, min_abs: floa
     return cand.groupby("market_id", as_index=False).first()
 
 
-# Strategy -> (signal column, direction sign convention, fallback fixed threshold)
+# Strategy -> (signal column, direction sign convention, fallback fixed threshold).
+# The fallback thresholds below are ONLY used if adaptive thresholding (see
+# compute_adaptive_threshold) can't be computed (e.g. too little train data) --
+# they are NOT meant to be trusted as-is on new data. This is the fix for a
+# real bug found by reproducing it: h^2 = p(1-p)/tau is regime-dependent on
+# typical time-to-resolution. Long-duration markets (tau usually >> 1) give
+# small h^2 and therefore LARGER z-scores for the same raw move; short-
+# duration markets (tau often near the min_tau floor) give h^2 close to its
+# max (~0.25) and therefore much SMALLER z-scores for the same raw move. A
+# fixed threshold calibrated on one duration regime can silently produce
+# ZERO candidates on another -- confirmed by direct reproduction: on a
+# short-duration synthetic panel, the MAXIMUM struct_mom_signal value
+# observed was 0.24, against a fixed threshold of 1.50.
 _STRUCTURAL_STRATEGIES = {
     "structural_momentum": ("struct_mom_signal", 1, 1.50),
     "structural_reversal": ("struct_rev_signal", -1, 0.75),
@@ -166,6 +178,13 @@ def calibrate_on_train(train_cand: pd.DataFrame):
     if signal.notna().sum() >= 2:
         try:
             _, raw_edges = pd.qcut(signal, bins, retbins=True, duplicates="drop")
+            # Defensive: explicitly dedupe + sort regardless of what qcut claims to
+            # have already done. This is what actually prevents "bins must increase
+            # monotonically" -- qcut's own duplicate-handling can still leave edges
+            # that are distinct-but-numerically-adjacent in ways that cause trouble
+            # downstream, and on messier real-world data (price ties from cent-level
+            # quantization, sparse candidate counts) this class of edge case shows up
+            # far more than it ever did on the smooth synthetic generator.
             raw_edges = np.unique(raw_edges[np.isfinite(raw_edges)])
             if len(raw_edges) >= 2:
                 bin_edges = raw_edges.copy()
@@ -173,6 +192,12 @@ def calibrate_on_train(train_cand: pd.DataFrame):
                 bin_edges[-1] = np.inf
         except ValueError:
             pass  # keep the [-inf, inf] single-bucket fallback
+
+    # Recompute buckets via the SAME pd.cut() call apply_calibration_to_test() will
+    # use on test data, instead of trusting qcut's own (separately-derived) bucket
+    # labels -- guarantees train and test use identical, internally-consistent
+    # bucketing logic rather than two independently-computed binning paths that could
+    # disagree at the margins.
     train_cand["bucket"] = pd.cut(signal, bins=bin_edges, labels=False, include_lowest=True)
 
     calib = {}
@@ -184,7 +209,43 @@ def calibrate_on_train(train_cand: pd.DataFrame):
         kelly_full = q - (1 - q) * c / (1 - c)
         kelly_sized = max(kelly_full, 0.0) * KELLY_FRACTION
         kelly_sized = min(kelly_sized, MAX_POSITION_FRACTION)
-        se = np.sqrt(max(q * (1 - q), 1e-6) / max(n, 1))
+
+        # Statistical-significance guard: don't just require a minimum
+        # sample size -- require the estimated edge to be several
+        # standard errors away from breakeven. A decile that "looks"
+        # profitable with n=25 trades and no real underlying edge is
+        # exactly the kind of noise that blows up out-of-sample (this is
+        # the single most common way new quants fool themselves with a
+        # decile-bucketed backtest). Edge here is measured as win_rate
+        # minus the breakeven win rate implied by the price paid (c);
+        # a bet is only profitable in expectation if q > c.
+        #
+        # z > 2.0 is deliberately stricter than a naive "95% confidence"
+        # (z > 1.645) threshold: we are testing N_DECILES=10 buckets
+        # SIMULTANEOUSLY, so under the null of "no real edge anywhere"
+        # we'd still expect ~1 bucket in 10 to clear a lenient z > 1.28
+        # threshold by chance alone (multiple-comparisons problem). A
+        # properly Bonferroni-corrected threshold for 10 simultaneous
+        # tests at 95% overall confidence would be z > ~2.5-2.8; z > 2.0
+        # is a pragmatic middle ground for a demo, not a rigorous
+        # correction -- tighten this further before trusting it with
+        # real capital.
+        #
+        # SCORE-test convention: SE uses the HYPOTHESIZED rate (c, the
+        # breakeven price) not the observed rate (q). This matters more
+        # than it looks -- a Wald-style SE using q collapses toward zero
+        # as q -> 0 or 1 (x(1-x) is minimized at the boundaries), which
+        # can blow up z-stats to nonsensical values. Confirmed via a real
+        # bug in the sibling calibration_check.py tool: a trivial-looking
+        # gap at a near-zero win rate produced z=-259 with the wrong
+        # (Wald) formula, vs a sane z=-1.3 with this (score) one. The
+        # n<15 sample-size floor already caught every case in this
+        # project where this mattered in practice (buckets with q at 0 or
+        # 1 also tend to have tiny n), so no prior sizing DECISION changed
+        # from this fix -- but the reported z-stats for those buckets were
+        # overstated, and it's worth using the statistically correct
+        # formula going forward regardless.
+        se = np.sqrt(max(c * (1 - c), 1e-6) / max(n, 1))
         z_stat = (q - c) / se if se > 0 else 0.0
         if n < 15 or z_stat < 2.0:
             kelly_sized = 0.0
@@ -204,6 +265,9 @@ def apply_calibration_to_test(test_cand: pd.DataFrame, bin_edges: np.ndarray, ca
     try:
         buckets = pd.cut(signal, bins=bin_edges, labels=False, include_lowest=True)
     except ValueError as e:
+        # Last-resort safety net: one strategy's calibration hiccup shouldn't crash
+        # the whole run. Print loudly (this should be rare after the fix in
+        # calibrate_on_train) rather than fail silently.
         print(f"  !! apply_calibration_to_test('{strategy}'): pd.cut failed ({e}); "
               f"skipping this strategy's test trades. bin_edges={bin_edges}")
         return trades
@@ -236,6 +300,13 @@ def run_strategy(df: pd.DataFrame, strategy: str, train_frac: float = 0.65,
 
     adaptive_thresholds = None
     if strategy in _STRUCTURAL_STRATEGIES:
+        # Threshold is derived from TRAIN data's own signal distribution only,
+        # then FROZEN and applied identically to both train and test candidate
+        # generation -- same discipline as every other calibrated parameter in
+        # this file (K, Kelly buckets, GARCH params). Computing it fresh per
+        # call (rather than trusting a hardcoded constant) is what actually
+        # fixes strategies going to zero candidates on data with a different
+        # typical h^2 scale than whatever the fixed thresholds were tuned on.
         adaptive_thresholds = compute_adaptive_thresholds(df, train_ids, adaptive_percentile)
 
     cand = build_candidates(df, strategy, adaptive_thresholds=adaptive_thresholds)

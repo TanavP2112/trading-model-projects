@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 from data_fetcher import build_market_panel
 from signals import add_signals, add_structural_signals
 from backtest import run_strategy, trades_to_frame, compute_metrics, train_test_split_by_market
-from config import RANDOM_SEED
+# from config import RANDOM_SEED
 
 pd.set_option("display.width", 120)
 
@@ -91,29 +91,57 @@ def main():
     # doesn't produce one -- add_structural_signals checks for the column's
     # presence and falls back to DR-only (K=0) rather than erroring. See the
     # module docstring at the top of this file.
-    panel, fitted_K = add_structural_signals(
+    #
+    # min_tau/bar_length=1/24 (one hour, in days): MUST match this data's
+    # actual fidelity_minutes=60 fetch. A real bug was found and fixed by
+    # comparing predicted vs realized variance on this exact data: without
+    # this override, h2 defaults to assuming DAILY bars and comes out
+    # systematically ~24x too large, which inflates the denominator of
+    # every structural signal and makes genuine edges harder to detect,
+    # not just a cosmetic scaling issue.
+    BAR_LENGTH_DAYS = 1 / 24
+    panel, fitted_K, garch_params, joint_garch_params = add_structural_signals(
         panel, train_market_ids=set(train_df_for_fit["market_id"]),
-        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread")
+        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread", fit_garch=True,
+        min_tau=BAR_LENGTH_DAYS, bar_length=BAR_LENGTH_DAYS,
+    )
     print(f"      Fitted AS-channel scale K = {fitted_K:.4f} "
           f"(expected 0.0 here -- no spread column from Path 2, so this is DR-only)")
+    if garch_params is not None:
+        print(f"      Fitted GARCH(1,1) on structural residuals: omega={garch_params['omega']:.4f}  "
+              f"alpha={garch_params['alpha']:.4f}  beta={garch_params['beta']:.4f}  "
+              f"persistence(a+b)={garch_params['alpha']+garch_params['beta']:.4f}  "
+              f"uncond_var={garch_params['uncond_var']:.4f}  nu={garch_params.get('nu')}  fit_ok={garch_params['fit_ok']}")
+        if garch_params['uncond_var'] > 5.0:
+            print(f"      !! uncond_var={garch_params['uncond_var']:.2f} is far from the ~1.0 a healthy fit "
+                  f"should give (z is constructed to have unit variance if h2 is well-calibrated) -- "
+                  f"the multiplicative GARCH layer is probably overstating variance broadly on this data. "
+                  f"Absolute cap in garch_multiplier_per_market will still bound it, but treat "
+                  f"struct_*_garch_signal results with real skepticism until this is understood.")
 
     print("[3/4] Running backtests (train/test split by market start date, 65/35)...")
     mom_trades, mom_calib = run_strategy(panel, "momentum")
     rev_trades, rev_calib = run_strategy(panel, "reversal")
     smom_trades, smom_calib = run_strategy(panel, "structural_momentum")
     srev_trades, srev_calib = run_strategy(panel, "structural_reversal")
+    smomg_trades, smomg_calib = run_strategy(panel, "structural_momentum_garch")
+    srevg_trades, srevg_calib = run_strategy(panel, "structural_reversal_garch")
 
     mom_df = trades_to_frame(mom_trades)
     rev_df = trades_to_frame(rev_trades)
     smom_df = trades_to_frame(smom_trades)
     srev_df = trades_to_frame(srev_trades)
-    all_frames = [d for d in [mom_df, rev_df, smom_df, srev_df] if not d.empty]
+    smomg_df = trades_to_frame(smomg_trades)
+    srevg_df = trades_to_frame(srevg_trades)
+    all_frames = [d for d in [mom_df, rev_df, smom_df, srev_df, smomg_df, srevg_df] if not d.empty]
     combined_df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
 
     mom_metrics = compute_metrics(mom_df)
     rev_metrics = compute_metrics(rev_df)
     smom_metrics = compute_metrics(smom_df)
     srev_metrics = compute_metrics(srev_df)
+    smomg_metrics = compute_metrics(smomg_df)
+    srevg_metrics = compute_metrics(srevg_df)
     combined_metrics = compute_metrics(combined_df) if not combined_df.empty else {"n_trades": 0}
 
     print("[4/4] Results:")
@@ -121,11 +149,14 @@ def main():
     print_metrics("REVERSAL strategy (naive rolling z-score)", rev_metrics)
     print_metrics("STRUCTURAL MOMENTUM (DR-AS vol-normalized)", smom_metrics)
     print_metrics("STRUCTURAL REVERSAL (DR-AS vol-normalized)", srev_metrics)
-    print_metrics("COMBINED portfolio (all four)", combined_metrics)
+    print_metrics("STRUCTURAL MOMENTUM + GARCH", smomg_metrics)
+    print_metrics("STRUCTURAL REVERSAL + GARCH", srevg_metrics)
+    print_metrics("COMBINED portfolio (all six)", combined_metrics)
 
     print("\n--- Train-set calibration tables (frozen before touching test set) ---")
     for name, calib in [("momentum", mom_calib), ("reversal", rev_calib),
-                        ("structural_momentum", smom_calib), ("structural_reversal", srev_calib)]:
+                        ("structural_momentum", smom_calib), ("structural_reversal", srev_calib),
+                        ("structural_momentum_garch", smomg_calib), ("structural_reversal_garch", srevg_calib)]:
         print(f"\n{name} buckets (win_rate, avg_price, n_train, z_stat, position_fraction):")
         for b, info in sorted(calib.items()):
             print(f"  bucket {b}: win_rate={info['win_rate']:.2f}  avg_price={info['avg_price']:.2f}  "
@@ -141,7 +172,7 @@ def main():
         if os.path.exists(fname):
             os.remove(fname)
     written = []
-    for fname, d in zip(all_trade_files, [mom_df, rev_df, smom_df, srev_df]):
+    for fname, d in zip(all_trade_files, [mom_df, rev_df, smom_df, srev_df, smomg_df, srevg_df]):
         if not d.empty:
             d.to_csv(fname, index=False)
             written.append(fname)
@@ -151,7 +182,9 @@ def main():
                            ("Reversal (naive)", rev_metrics, "#dc2626"),
                            ("Structural Momentum (DR-AS)", smom_metrics, "#7c3aed"),
                            ("Structural Reversal (DR-AS)", srev_metrics, "#ea580c"),
-                           ("Combined (all four)", combined_metrics, "#16a34a")]:
+                           ("Structural Momentum + GARCH", smomg_metrics, "#0891b2"),
+                           ("Structural Reversal + GARCH", srevg_metrics, "#be185d"),
+                           ("Combined (all six)", combined_metrics, "#16a34a")]:
         if m.get("n_trades", 0) > 0 and "equity_curve" in m:
             ax.plot(m["equity_curve"].index, m["equity_curve"].values, label=name, color=color, linewidth=1.6)
     ax.axhline(1.0, color="grey", linestyle="--", linewidth=0.8)

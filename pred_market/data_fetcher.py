@@ -248,6 +248,10 @@ def build_market_panel(min_volume: float = 50_000, max_markets: int = 300,
         result.to_parquet(checkpoint_path, index=False)
     return result
 
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
 
 # ===========================================================================
 # PATH 2 (fallback): raw REST, no extra dependency
