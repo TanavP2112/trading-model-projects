@@ -47,10 +47,37 @@ from config import GAMMA_MARKETS_ENDPOINT, CLOB_PRICE_HISTORY_ENDPOINT
 # ===========================================================================
 # PATH 1 (preferred): official polymarket-client SDK
 # ===========================================================================
+def _resolve_category(m) -> str:
+    """
+    m.category is a genuinely optional field (str | None, confirmed via
+    direct model introspection) that Polymarket's API frequently leaves
+    empty -- confirmed necessary after a real fetch came back with every
+    single market categorized as "other". The real categorization lives in
+    m.tags (a list of MarketTag(id, slug, label) objects) instead. This
+    scans tag labels/slugs for a match against the known fee-schedule
+    categories (see config.FEE_RATE_BY_CATEGORY) before giving up.
+
+    Falling back to "other" incorrectly isn't just a labeling nuisance --
+    it directly mis-prices every affected trade's fees (a crypto market
+    silently charged the "other" rate instead of crypto's, for example),
+    so this matters for backtest accuracy, not just readability.
+    """
+    if m.category:
+        return m.category.lower()
+    known_categories = {"crypto", "sports", "finance", "politics", "mentions",
+                        "tech", "economics", "culture", "weather", "geopolitics"}
+    for tag in getattr(m, "tags", ()) or ():
+        for candidate in (getattr(tag, "label", None), getattr(tag, "slug", None)):
+            if candidate and candidate.lower() in known_categories:
+                return candidate.lower()
+    return "other"
+
+
 def build_market_panel(min_volume: float = 50_000, max_markets: int = 300,
                         fidelity_minutes: int = 60, interval: str = "max",
                         checkpoint_path: str | None = "data/_fetch_checkpoint.parquet",
-                        checkpoint_every: int = 50, max_retries: int = 3) -> pd.DataFrame:
+                        checkpoint_every: int = 50, max_retries: int = 3,
+                        tag_slug: str | None = None) -> pd.DataFrame:
     """
     Pull resolved markets + full price history using the official SDK.
     Confirmed-real signatures (verified 2026 against polymarket-client==0.1.0b20),
@@ -100,6 +127,26 @@ def build_market_panel(min_volume: float = 50_000, max_markets: int = 300,
         return PublicClient()
 
     client = _new_client()
+
+    # Server-side category filtering: look up the real tag_id at runtime via
+    # get_tag(slug=...) rather than hardcoding a guessed numeric ID, which
+    # is more robust and self-corrects if Polymarket ever changes tag IDs.
+    # This is meaningfully better than fetching broadly and filtering
+    # client-side afterward -- your whole max_markets budget goes toward
+    # the category you actually want, instead of being diluted across every
+    # category and then thrown away.
+    resolved_tag_id = None
+    if tag_slug is not None:
+        try:
+            tag = client.get_tag(slug=tag_slug)
+            resolved_tag_id = int(tag.id)
+            print(f"      Resolved tag_slug='{tag_slug}' -> tag_id={resolved_tag_id} "
+                  f"(label='{tag.label}')")
+        except Exception as e:
+            print(f"      !! Could not resolve tag_slug='{tag_slug}' ({type(e).__name__}: {e}) -- "
+                  f"proceeding WITHOUT a category filter. Check the slug is correct "
+                  f"(try client.list_tags() to see available slugs) before trusting this run's category label.")
+
     count = len(already_fetched_ids)
     scanned = 0
     since_checkpoint = 0
@@ -110,6 +157,7 @@ def build_market_panel(min_volume: float = 50_000, max_markets: int = 300,
             order="volume",
             ascending=False,
             page_size=100,
+            **({"tag_id": resolved_tag_id} if resolved_tag_id is not None else {}),
         )
         for m in paginator.iter_items():
             if count >= max_markets:
@@ -153,7 +201,7 @@ def build_market_panel(min_volume: float = 50_000, max_markets: int = 300,
             hist = hist.sort_values("timestamp").reset_index(drop=True)
 
             hist["market_id"] = m.id
-            hist["category"] = (m.category or "other").lower()
+            hist["category"] = tag_slug.lower() if tag_slug else _resolve_category(m)
             hist["volume"] = float(m.metrics.volume) if m.metrics and m.metrics.volume is not None else 0.0
 
             end_date = m.state.end_date if m.state else None
@@ -199,10 +247,6 @@ def build_market_panel(min_volume: float = 50_000, max_markets: int = 300,
     if checkpoint_path:
         result.to_parquet(checkpoint_path, index=False)
     return result
-
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
 
 
 # ===========================================================================

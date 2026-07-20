@@ -59,21 +59,21 @@ def print_metrics(name: str, m: dict):
 def main():
     banner()
 
-    print("\n[1/4] Fetching real resolved Polymarket markets...")
-    # build_market_panel() now has its own built-in checkpointing/resume
-    # logic (checkpoint_path below) -- it saves progress every
-    # checkpoint_every markets, and on a fresh call, skips any market_id
-    # already present in that file. This subsumes the separate cache-check
-    # wrapper that used to live here: if CACHE_PATH already has everything
-    # you asked for, the resume logic sees that on its very first iteration
-    # and returns almost instantly; if it's a full fresh start, there's
-    # nothing to skip and it behaves like a normal fetch; if a previous run
-    # crashed partway through (this is what motivated adding this at all --
-    # a real ConnectionTerminated error lost 43 minutes of progress at
-    # 1300/1500 markets with no checkpointing), it picks up from wherever
-    # it stopped instead of starting over.
-    CACHE_PATH = "data/real_panel_cache.parquet"
-    panel = build_market_panel(min_volume=10_000, max_markets=1350,
+    print("\n[1/4] Fetching real resolved Polymarket sports markets...")
+    # tag_slug="sports" filters SERVER-SIDE via list_markets(tag_id=...) --
+    # the real tag_id is looked up at runtime via get_tag(slug="sports")
+    # rather than hardcoded, so this self-corrects if Polymarket ever
+    # changes tag IDs. This is meaningfully better than fetching broadly
+    # and filtering client-side afterward: the whole max_markets budget now
+    # goes toward sports specifically, instead of being diluted across
+    # every category and mostly thrown away (sports was previously getting
+    # maybe 40% of a pooled fetch; now it gets 100%).
+    #
+    # Separate cache file from the pooled fetch on purpose -- don't want a
+    # sports-only run to silently overwrite the full multi-category dataset
+    # you already fetched, in case you want both.
+    CACHE_PATH = "data/real_panel_cache_sports.parquet"
+    panel = build_market_panel(min_volume=10_000, max_markets=1500, tag_slug="sports",
                                 checkpoint_path=CACHE_PATH, checkpoint_every=50, max_retries=5)
     if panel.empty:
         print("      Got 0 markets/rows back. Stopping here -- fix the fetch before")
@@ -93,8 +93,7 @@ def main():
     # module docstring at the top of this file.
     panel, fitted_K = add_structural_signals(
         panel, train_market_ids=set(train_df_for_fit["market_id"]),
-        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread"
-    )
+        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread")
     print(f"      Fitted AS-channel scale K = {fitted_K:.4f} "
           f"(expected 0.0 here -- no spread column from Path 2, so this is DR-only)")
 
@@ -122,7 +121,7 @@ def main():
     print_metrics("REVERSAL strategy (naive rolling z-score)", rev_metrics)
     print_metrics("STRUCTURAL MOMENTUM (DR-AS vol-normalized)", smom_metrics)
     print_metrics("STRUCTURAL REVERSAL (DR-AS vol-normalized)", srev_metrics)
-    print_metrics("COMBINED portfolio (all six)", combined_metrics)
+    print_metrics("COMBINED portfolio (all four)", combined_metrics)
 
     print("\n--- Train-set calibration tables (frozen before touching test set) ---")
     for name, calib in [("momentum", mom_calib), ("reversal", rev_calib),
@@ -158,7 +157,11 @@ def main():
     ax.axhline(1.0, color="grey", linestyle="--", linewidth=0.8)
     ax.set_title("Real Polymarket backtest equity curves (test set)")
     ax.set_ylabel("Equity (starting = 1.0)")
-    ax.legend(fontsize=8)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No strategy produced any trades this run", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
     fig.tight_layout()
     fig.savefig("results/equity_curves.png", dpi=140)
     written.append("results/equity_curves.png")
