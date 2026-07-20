@@ -89,6 +89,8 @@ _STRUCTURAL_STRATEGIES = {
     "structural_reversal": ("struct_rev_signal", -1, 0.75),
     "structural_momentum_garch": ("struct_mom_garch_signal", 1, 1.50),
     "structural_reversal_garch": ("struct_rev_garch_signal", -1, 0.75),
+    "structural_momentum_jointgarch": ("struct_mom_jointgarch_signal", 1, 1.50),
+    "structural_reversal_jointgarch": ("struct_rev_jointgarch_signal", -1, 0.75),
 }
 ADAPTIVE_PERCENTILE = 97.0   # target selectivity: top ~3% of |signal| on TRAIN data
 
@@ -247,7 +249,7 @@ def calibrate_on_train(train_cand: pd.DataFrame):
         # formula going forward regardless.
         se = np.sqrt(max(c * (1 - c), 1e-6) / max(n, 1))
         z_stat = (q - c) / se if se > 0 else 0.0
-        if n < 15 or z_stat < 2.0:
+        if n < 15 or z_stat < 1.96:
             kelly_sized = 0.0
 
         calib[int(b)] = {"win_rate": q, "avg_price": c, "n_train": n,

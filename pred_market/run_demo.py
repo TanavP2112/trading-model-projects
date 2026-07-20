@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 from data_fetcher import build_market_panel
 from signals import add_signals, add_structural_signals
 from backtest import run_strategy, trades_to_frame, compute_metrics, train_test_split_by_market
-# from config import RANDOM_SEED
+from config import RANDOM_SEED
 
 pd.set_option("display.width", 120)
 
@@ -102,11 +102,17 @@ def main():
     BAR_LENGTH_DAYS = 1 / 24
     panel, fitted_K, garch_params, joint_garch_params = add_structural_signals(
         panel, train_market_ids=set(train_df_for_fit["market_id"]),
-        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread", fit_garch=True,
+        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread",
+        fit_garch=True, fit_joint_garch=True,
         min_tau=BAR_LENGTH_DAYS, bar_length=BAR_LENGTH_DAYS,
     )
     print(f"      Fitted AS-channel scale K = {fitted_K:.4f} "
           f"(expected 0.0 here -- no spread column from Path 2, so this is DR-only)")
+    if joint_garch_params is not None:
+        print(f"      Fitted JOINT additive GARCH+DR-AS: K={joint_garch_params['K']:.4f}  "
+              f"omega={joint_garch_params['omega']:.6f}  alpha={joint_garch_params['alpha']:.4f}  "
+              f"beta={joint_garch_params['beta']:.4f}  c={joint_garch_params['c']:.4f}  "
+              f"persistence={joint_garch_params['persistence']:.4f}  success={joint_garch_params['success']}")
     if garch_params is not None:
         print(f"      Fitted GARCH(1,1) on structural residuals: omega={garch_params['omega']:.4f}  "
               f"alpha={garch_params['alpha']:.4f}  beta={garch_params['beta']:.4f}  "
@@ -126,6 +132,8 @@ def main():
     srev_trades, srev_calib = run_strategy(panel, "structural_reversal")
     smomg_trades, smomg_calib = run_strategy(panel, "structural_momentum_garch")
     srevg_trades, srevg_calib = run_strategy(panel, "structural_reversal_garch")
+    smomjg_trades, smomjg_calib = run_strategy(panel, "structural_momentum_jointgarch")
+    srevjg_trades, srevjg_calib = run_strategy(panel, "structural_reversal_jointgarch")
 
     mom_df = trades_to_frame(mom_trades)
     rev_df = trades_to_frame(rev_trades)
@@ -133,7 +141,10 @@ def main():
     srev_df = trades_to_frame(srev_trades)
     smomg_df = trades_to_frame(smomg_trades)
     srevg_df = trades_to_frame(srevg_trades)
-    all_frames = [d for d in [mom_df, rev_df, smom_df, srev_df, smomg_df, srevg_df] if not d.empty]
+    smomjg_df = trades_to_frame(smomjg_trades)
+    srevjg_df = trades_to_frame(srevjg_trades)
+    all_frames = [d for d in [mom_df, rev_df, smom_df, srev_df, smomg_df, srevg_df, smomjg_df, srevjg_df]
+                  if not d.empty]
     combined_df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
 
     mom_metrics = compute_metrics(mom_df)
@@ -142,6 +153,8 @@ def main():
     srev_metrics = compute_metrics(srev_df)
     smomg_metrics = compute_metrics(smomg_df)
     srevg_metrics = compute_metrics(srevg_df)
+    smomjg_metrics = compute_metrics(smomjg_df)
+    srevjg_metrics = compute_metrics(srevjg_df)
     combined_metrics = compute_metrics(combined_df) if not combined_df.empty else {"n_trades": 0}
 
     print("[4/4] Results:")
@@ -149,14 +162,18 @@ def main():
     print_metrics("REVERSAL strategy (naive rolling z-score)", rev_metrics)
     print_metrics("STRUCTURAL MOMENTUM (DR-AS vol-normalized)", smom_metrics)
     print_metrics("STRUCTURAL REVERSAL (DR-AS vol-normalized)", srev_metrics)
-    print_metrics("STRUCTURAL MOMENTUM + GARCH", smomg_metrics)
-    print_metrics("STRUCTURAL REVERSAL + GARCH", srevg_metrics)
-    print_metrics("COMBINED portfolio (all six)", combined_metrics)
+    print_metrics("STRUCTURAL MOMENTUM + GARCH (multiplicative, approximate)", smomg_metrics)
+    print_metrics("STRUCTURAL REVERSAL + GARCH (multiplicative, approximate)", srevg_metrics)
+    print_metrics("STRUCTURAL MOMENTUM + GARCH (joint additive, paper-correct)", smomjg_metrics)
+    print_metrics("STRUCTURAL REVERSAL + GARCH (joint additive, paper-correct)", srevjg_metrics)
+    print_metrics("COMBINED portfolio (all eight)", combined_metrics)
 
     print("\n--- Train-set calibration tables (frozen before touching test set) ---")
     for name, calib in [("momentum", mom_calib), ("reversal", rev_calib),
                         ("structural_momentum", smom_calib), ("structural_reversal", srev_calib),
-                        ("structural_momentum_garch", smomg_calib), ("structural_reversal_garch", srevg_calib)]:
+                        ("structural_momentum_garch", smomg_calib), ("structural_reversal_garch", srevg_calib),
+                        ("structural_momentum_jointgarch", smomjg_calib),
+                        ("structural_reversal_jointgarch", srevjg_calib)]:
         print(f"\n{name} buckets (win_rate, avg_price, n_train, z_stat, position_fraction):")
         for b, info in sorted(calib.items()):
             print(f"  bucket {b}: win_rate={info['win_rate']:.2f}  avg_price={info['avg_price']:.2f}  "
@@ -167,12 +184,15 @@ def main():
     import os
     all_trade_files = ["results/momentum_trades.csv", "results/reversal_trades.csv",
                        "results/structural_momentum_trades.csv", "results/structural_reversal_trades.csv",
-                       "results/structural_momentum_garch_trades.csv", "results/structural_reversal_garch_trades.csv"]
+                       "results/structural_momentum_garch_trades.csv", "results/structural_reversal_garch_trades.csv",
+                       "results/structural_momentum_jointgarch_trades.csv",
+                       "results/structural_reversal_jointgarch_trades.csv"]
     for fname in all_trade_files:
         if os.path.exists(fname):
             os.remove(fname)
     written = []
-    for fname, d in zip(all_trade_files, [mom_df, rev_df, smom_df, srev_df, smomg_df, srevg_df]):
+    all_dfs = [mom_df, rev_df, smom_df, srev_df, smomg_df, srevg_df, smomjg_df, srevjg_df]
+    for fname, d in zip(all_trade_files, all_dfs):
         if not d.empty:
             d.to_csv(fname, index=False)
             written.append(fname)
@@ -182,16 +202,18 @@ def main():
                            ("Reversal (naive)", rev_metrics, "#dc2626"),
                            ("Structural Momentum (DR-AS)", smom_metrics, "#7c3aed"),
                            ("Structural Reversal (DR-AS)", srev_metrics, "#ea580c"),
-                           ("Structural Momentum + GARCH", smomg_metrics, "#0891b2"),
-                           ("Structural Reversal + GARCH", srevg_metrics, "#be185d"),
-                           ("Combined (all six)", combined_metrics, "#16a34a")]:
+                           ("Structural Momentum + GARCH (mult.)", smomg_metrics, "#0891b2"),
+                           ("Structural Reversal + GARCH (mult.)", srevg_metrics, "#be185d"),
+                           ("Structural Momentum + GARCH (joint)", smomjg_metrics, "#65a30d"),
+                           ("Structural Reversal + GARCH (joint)", srevjg_metrics, "#c2410c"),
+                           ("Combined (all eight)", combined_metrics, "#16a34a")]:
         if m.get("n_trades", 0) > 0 and "equity_curve" in m:
             ax.plot(m["equity_curve"].index, m["equity_curve"].values, label=name, color=color, linewidth=1.6)
     ax.axhline(1.0, color="grey", linestyle="--", linewidth=0.8)
     ax.set_title("Real Polymarket backtest equity curves (test set)")
     ax.set_ylabel("Equity (starting = 1.0)")
     if ax.get_legend_handles_labels()[0]:
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7)
     else:
         ax.text(0.5, 0.5, "No strategy produced any trades this run", ha="center", va="center",
                 transform=ax.transAxes, color="grey")

@@ -247,7 +247,7 @@ def _joint_h2_recursion(eps: np.ndarray, b: np.ndarray, omega: float, alpha: flo
         for t in range(start + 1, end):
             prev_eps = eps[t - 1]
             prev_eps = 0.0 if not np.isfinite(prev_eps) else prev_eps
-            raw = omega + alpha * (prev_eps ** 2) + beta * h2[t - 1] + c * max(b[t], 0.0)
+            raw = omega + alpha * (prev_eps ** 2) + beta * h2[t - 1] + c * max(b[t - 1], 0.0)
             h2[t] = min(max(raw, 1e-12), h2_ceiling)
     return h2
 
@@ -409,6 +409,27 @@ def fit_residual_garch(standardized_residuals: np.ndarray, dist: str = "t") -> d
         # "no extra clustering info", i.e. a flat multiplier of 1 everywhere.
         return {"omega": 0.0, "alpha": 0.0, "beta": 0.0, "uncond_var": 1.0, "nu": None, "fit_ok": False}
 
+    # WINSORIZATION -- added after Student-t alone was confirmed insufficient
+    # on real data (uncond_var stayed at ~46 even with nu correctly fit to
+    # ~4.0, i.e. real heavy tails). Root cause: z=eps/h is a RATIO, and h can
+    # be genuinely tiny near price boundaries (structurally correct -- a
+    # near-certain market has near-zero predicted variance). If a real
+    # surprise (a true upset) lands on exactly such a low-h observation, the
+    # resulting z is enormous NOT because the overall distribution is
+    # fat-tailed in a way Student-t's single shape parameter can absorb, but
+    # because that ONE observation's denominator was pathologically small.
+    # Confirmed via direct construction: a single such point can leave a
+    # DIFFERENCE-based average (h2 vs realized, what the plain VRP check
+    # uses) looking essentially balanced while a RATIO-based average (z^2,
+    # what feeds uncond_var) is inflated by 10x+ from that one point alone.
+    # Winsorizing clips the SYMPTOM regardless of cause -- whether it's
+    # genuine fat tails or denominator heterogeneity, no single point can
+    # dominate the likelihood after this.
+    winsor_limit = np.percentile(np.abs(z), 99.0)
+    winsor_limit = max(winsor_limit, 3.0)  # never clip tighter than 3 sigma even on very clean data
+    n_winsorized = int(np.sum(np.abs(z) > winsor_limit))
+    z = np.clip(z, -winsor_limit, winsor_limit)
+
     scale = 100.0  # rescale for optimizer numerical stability; unscaled below
     am = arch_model(z * scale, mean="Zero", vol="GARCH", p=1, q=1, dist=dist)
     try:
@@ -420,6 +441,17 @@ def fit_residual_garch(standardized_residuals: np.ndarray, dist: str = "t") -> d
     alpha = float(res.params["alpha[1]"])
     beta = float(res.params["beta[1]"])
     nu = float(res.params["nu"]) if "nu" in res.params else None
+    # NU FLOOR -- Student-t variance is only finite for nu>2; a fit landing
+    # near that boundary (confirmed on real data: nu=2.05) is inherently
+    # unstable regardless of what's driving it, since the distribution's own
+    # variance is nearly undefined there. This isn't a fix for the root
+    # cause (found to be a genuinely high rate of near-boundary-market
+    # surprises in this data, not something a single distributional choice
+    # fully absorbs -- see the joint additive model as the real fix for
+    # that), just a last-resort sanity floor so a near-degenerate nu can't
+    # silently produce a near-degenerate downstream forecast.
+    if nu is not None and nu < 4.0:
+        nu = 4.0
     persistence = alpha + beta
 
     # STATIONARITY SAFEGUARD -- a real bug found on real data: with no cap
@@ -441,7 +473,8 @@ def fit_residual_garch(standardized_residuals: np.ndarray, dist: str = "t") -> d
         persistence = alpha + beta
 
     uncond_var = omega / (1 - persistence) if persistence < 1 else float(np.mean(z ** 2))
-    return {"omega": omega, "alpha": alpha, "beta": beta, "uncond_var": uncond_var, "nu": nu, "fit_ok": True}
+    return {"omega": omega, "alpha": alpha, "beta": beta, "uncond_var": uncond_var, "nu": nu,
+            "fit_ok": True, "n_winsorized": n_winsorized, "winsor_limit": float(winsor_limit)}
 
 
 def garch_multiplier_per_market(df: pd.DataFrame, resid_col: str, garch_params: dict,

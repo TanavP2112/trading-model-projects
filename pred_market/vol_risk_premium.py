@@ -123,16 +123,39 @@ def compute_vrp_with_garch(panel: pd.DataFrame, min_volume: float = MIN_VOLUME_U
     train_ids = set(train_df["market_id"])
     test_ids = set(test_df["market_id"])
 
+    # FIX: previously this called add_structural_signals TWICE -- the first
+    # call's output (and fitting work) was immediately discarded by the
+    # second, and the second call dropped train_market_ids=train_ids
+    # (leaking test data into the GARCH fit) and referenced a bare
+    # BAR_LENGTH_DAYS global that only exists in the __main__ block below,
+    # so calling this function from anywhere else raised NameError. Now
+    # there's a single call using the local min_tau/bar_length and the
+    # train-only market ids, matching the "test set only, held out from
+    # GARCH's own fitting" contract described above.
     panel, fitted_K, garch_params, joint_garch_params = add_structural_signals(
-        panel, train_market_ids=train_ids, spread_col="spread", fit_garch=True,
+        panel, train_market_ids=train_ids,
+        struct_mom_lookback=5, struct_rev_lookback=10, spread_col="spread",
+        fit_garch=True, fit_joint_garch=True,
         min_tau=min_tau, bar_length=bar_length,
     )
+    print(f"      Fitted AS-channel scale K = {fitted_K:.4f} "
+          f"(expected 0.0 here -- no spread column from Path 2, so this is DR-only)")
+    if joint_garch_params is not None:
+        print(f"      Fitted JOINT additive GARCH+DR-AS: K={joint_garch_params['K']:.4f}  "
+              f"omega={joint_garch_params['omega']:.6f}  alpha={joint_garch_params['alpha']:.4f}  "
+              f"beta={joint_garch_params['beta']:.4f}  c={joint_garch_params['c']:.4f}  "
+              f"persistence={joint_garch_params['persistence']:.4f}  success={joint_garch_params['success']}")
     if garch_params is not None:
-        print(f"Fitted GARCH(1,1): omega={garch_params['omega']:.6f}  alpha={garch_params['alpha']:.4f}  "
-              f"beta={garch_params['beta']:.4f}  persistence={garch_params['alpha']+garch_params['beta']:.4f}  "
+        print(f"      Fitted GARCH(1,1) on structural residuals: omega={garch_params['omega']:.4f}  "
+              f"alpha={garch_params['alpha']:.4f}  beta={garch_params['beta']:.4f}  "
+              f"persistence(a+b)={garch_params['alpha']+garch_params['beta']:.4f}  "
               f"uncond_var={garch_params['uncond_var']:.4f}  nu={garch_params.get('nu')}  fit_ok={garch_params['fit_ok']}")
         if garch_params['uncond_var'] > 5.0:
-            print(f"!! uncond_var far from ~1.0 -- see run_demo_real_data.py's comment on what this means.")
+            print(f"      !! uncond_var={garch_params['uncond_var']:.2f} is far from the ~1.0 a healthy fit "
+                  f"should give (z is constructed to have unit variance if h2 is well-calibrated) -- "
+                  f"the multiplicative GARCH layer is probably overstating variance broadly on this data. "
+                  f"Absolute cap in garch_multiplier_per_market will still bound it, but treat "
+                  f"struct_*_garch_signal results with real skepticism until this is understood.")
 
     panel = panel.sort_values(["market_id", "timestamp"]).copy()
     panel["_next_price"] = panel.groupby("market_id")["price"].shift(-1)

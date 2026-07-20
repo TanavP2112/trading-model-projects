@@ -192,7 +192,8 @@ def add_structural_signals(df: pd.DataFrame, train_market_ids: set, struct_mom_l
         # structural model fully explained variance, z_i would be ~unit-
         # variance iid noise; leftover clustering here is exactly the
         # "residual GARCH dynamics" the paper layers on top.
-        eps = df.groupby("market_id")["price"].diff()
+        next_price = df.groupby("market_id")["price"].shift(-1)
+        eps = next_price - df["price"]
         df["_z_struct"] = eps / np.sqrt(df["h2"].clip(lower=1e-12))
 
         train_z = df.loc[df["market_id"].isin(train_market_ids), "_z_struct"]
