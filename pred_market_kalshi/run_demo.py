@@ -101,26 +101,23 @@ def run_expanding_walk_forward(
         .reset_index()
     )
 
-    # Aggregate By-Category Performance Across Out-of-Sample Folds
+    # Aggregate By-Category Performance Across Out-of-Sample Folds.
+    # backtest.generate_trades already produces net_pnl (direction-aware,
+    # share-sized, round-trip fees deducted) -- USE IT DIRECTLY. Earlier
+    # versions tried to recompute PnL as (exit_price - price) * volume,
+    # which fell through to zero because the column is called entry_price
+    # (not price), and even the intended fallback formula was wrong: it
+    # would have ignored direction (flipping sign on NO trades), used
+    # panel volume instead of shares held, and skipped fees.
     if "category" in full_wf_trades.columns and not full_wf_trades.empty:
-        
-        # 1. Compute PnL if missing (adjust formula according to your backtest trade log structure)
-        if "pnl" not in full_wf_trades.columns:
-            if "exit_price" in full_wf_trades.columns and "price" in full_wf_trades.columns:
-                # Simple price delta * volume calculation
-                full_wf_trades["pnl"] = (full_wf_trades["exit_price"] - full_wf_trades["price"]) * full_wf_trades.get("volume", 1)
-            else:
-                # Fallback to zero if unavailable to prevent crashing
-                full_wf_trades["pnl"] = 0.0
-
-        # 2. Perform aggregation safely
         agg_by_cat = (
             full_wf_trades.groupby(["strategy", "horizon_hours", "category"])
             .agg(
                 n_trades=("market_id", "count"),
-                win_rate=("pnl", lambda x: (x > 0).mean() if len(x) > 0 else 0.0),
-                mean_pnl=("pnl", "mean"),
-                total_pnl=("pnl", "sum"),
+                win_rate=("net_pnl", lambda x: (x > 0).mean() if len(x) > 0 else 0.0),
+                mean_pnl=("net_pnl", "mean"),
+                total_pnl=("net_pnl", "sum"),
+                total_fees=("fees", "sum"),
             )
             .reset_index()
         )
