@@ -231,7 +231,7 @@ def build_market_panel(min_volume: float = 50_000, max_markets: int = 300,
                 remaining = (max_markets - count) / rate if rate > 0 else float("nan")
                 print(f"      ...{count}/{max_markets} markets fetched "
                       f"({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining at current rate)")
-            time.sleep(0.1)  # polite pacing even though there's no auth/rate-limit requirement documented
+            time.sleep(0.1)
     finally:
         try:
             client.close()
@@ -247,10 +247,6 @@ def build_market_panel(min_volume: float = 50_000, max_markets: int = 300,
     if checkpoint_path:
         result.to_parquet(checkpoint_path, index=False)
     return result
-
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
 
 
 # ===========================================================================

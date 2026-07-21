@@ -60,18 +60,6 @@ def main():
     banner()
 
     print("\n[1/4] Fetching real resolved Polymarket sports markets...")
-    # tag_slug="sports" filters SERVER-SIDE via list_markets(tag_id=...) --
-    # the real tag_id is looked up at runtime via get_tag(slug="sports")
-    # rather than hardcoded, so this self-corrects if Polymarket ever
-    # changes tag IDs. This is meaningfully better than fetching broadly
-    # and filtering client-side afterward: the whole max_markets budget now
-    # goes toward sports specifically, instead of being diluted across
-    # every category and mostly thrown away (sports was previously getting
-    # maybe 40% of a pooled fetch; now it gets 100%).
-    #
-    # Separate cache file from the pooled fetch on purpose -- don't want a
-    # sports-only run to silently overwrite the full multi-category dataset
-    # you already fetched, in case you want both.
     CACHE_PATH = "data/real_panel_cache_sports.parquet"
     panel = build_market_panel(min_volume=10_000, max_markets=1500, tag_slug="sports",
                                 checkpoint_path=CACHE_PATH, checkpoint_every=50, max_retries=5)
@@ -87,18 +75,6 @@ def main():
 
     print("      Fitting DR-AS structural volatility model (K fit on train markets only)...")
     train_df_for_fit, _ = train_test_split_by_market(panel)
-    # spread_col="spread" is harmless to pass even though build_market_panel()
-    # doesn't produce one -- add_structural_signals checks for the column's
-    # presence and falls back to DR-only (K=0) rather than erroring. See the
-    # module docstring at the top of this file.
-    #
-    # min_tau/bar_length=1/24 (one hour, in days): MUST match this data's
-    # actual fidelity_minutes=60 fetch. A real bug was found and fixed by
-    # comparing predicted vs realized variance on this exact data: without
-    # this override, h2 defaults to assuming DAILY bars and comes out
-    # systematically ~24x too large, which inflates the denominator of
-    # every structural signal and makes genuine edges harder to detect,
-    # not just a cosmetic scaling issue.
     BAR_LENGTH_DAYS = 1 / 24
     panel, fitted_K, garch_params, joint_garch_params = add_structural_signals(
         panel, train_market_ids=set(train_df_for_fit["market_id"]),

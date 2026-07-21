@@ -150,14 +150,6 @@ def add_structural_signals(df: pd.DataFrame, train_market_ids: set, struct_mom_l
     individual fitted parameters shouldn't be over-interpreted, though this
     doesn't necessarily hurt out-of-sample forecast quality, which is a
     separate question the train/test backtest is built to answer empirically.
-
-    min_tau/bar_length: MUST match your actual bar spacing, in days (see
-    volatility_model.py's module docstring -- this is a real bug that was
-    found and fixed: h^2 is systematically wrong by the ratio of 1 day to
-    your actual bar length if these aren't set correctly). Defaults to
-    volatility_model's DEFAULT_MIN_TAU/DEFAULT_BAR_LENGTH (1.0, i.e. daily
-    bars) if not provided -- explicitly pass min_tau=bar_length=1/24 for
-    hourly data (this project's real-data fetch default).
     """
     from volatility_model import DEFAULT_MIN_TAU, DEFAULT_BAR_LENGTH
     if min_tau is None:

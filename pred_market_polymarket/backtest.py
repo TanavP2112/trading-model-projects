@@ -211,42 +211,6 @@ def calibrate_on_train(train_cand: pd.DataFrame):
         kelly_full = q - (1 - q) * c / (1 - c)
         kelly_sized = max(kelly_full, 0.0) * KELLY_FRACTION
         kelly_sized = min(kelly_sized, MAX_POSITION_FRACTION)
-
-        # Statistical-significance guard: don't just require a minimum
-        # sample size -- require the estimated edge to be several
-        # standard errors away from breakeven. A decile that "looks"
-        # profitable with n=25 trades and no real underlying edge is
-        # exactly the kind of noise that blows up out-of-sample (this is
-        # the single most common way new quants fool themselves with a
-        # decile-bucketed backtest). Edge here is measured as win_rate
-        # minus the breakeven win rate implied by the price paid (c);
-        # a bet is only profitable in expectation if q > c.
-        #
-        # z > 2.0 is deliberately stricter than a naive "95% confidence"
-        # (z > 1.645) threshold: we are testing N_DECILES=10 buckets
-        # SIMULTANEOUSLY, so under the null of "no real edge anywhere"
-        # we'd still expect ~1 bucket in 10 to clear a lenient z > 1.28
-        # threshold by chance alone (multiple-comparisons problem). A
-        # properly Bonferroni-corrected threshold for 10 simultaneous
-        # tests at 95% overall confidence would be z > ~2.5-2.8; z > 2.0
-        # is a pragmatic middle ground for a demo, not a rigorous
-        # correction -- tighten this further before trusting it with
-        # real capital.
-        #
-        # SCORE-test convention: SE uses the HYPOTHESIZED rate (c, the
-        # breakeven price) not the observed rate (q). This matters more
-        # than it looks -- a Wald-style SE using q collapses toward zero
-        # as q -> 0 or 1 (x(1-x) is minimized at the boundaries), which
-        # can blow up z-stats to nonsensical values. Confirmed via a real
-        # bug in the sibling calibration_check.py tool: a trivial-looking
-        # gap at a near-zero win rate produced z=-259 with the wrong
-        # (Wald) formula, vs a sane z=-1.3 with this (score) one. The
-        # n<15 sample-size floor already caught every case in this
-        # project where this mattered in practice (buckets with q at 0 or
-        # 1 also tend to have tiny n), so no prior sizing DECISION changed
-        # from this fix -- but the reported z-stats for those buckets were
-        # overstated, and it's worth using the statistically correct
-        # formula going forward regardless.
         se = np.sqrt(max(c * (1 - c), 1e-6) / max(n, 1))
         z_stat = (q - c) / se if se > 0 else 0.0
         if n < 15 or z_stat < 1.96:
