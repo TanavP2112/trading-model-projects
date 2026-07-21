@@ -1,15 +1,6 @@
-"""
-test1.py — Walk-Forward Benchmark for Structural Volatility Models
-Fulfills Xi et al. (2026) paper evaluation across all 4 models:
-  1. DR          (Wright-Fisher baseline)
-  2. DR-AS       (Wright-Fisher + Glosten-Milgrom adverse selection)
-  3. GARCH       (Pure GARCH(1,1) joint QMLE, c=0, K=0)
-  4. GARCH+DR-AS (Full structural GARCH joint QMLE, c>0, K>0)
-"""
-
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 import volatility_model as vm
 
 
@@ -44,11 +35,10 @@ def predict_h2_all_models(
     )
     
     # Track original test indices within full_df
-    test_market_timestamps = set(zip(test_df["market_id"], test_df["timestamp"]))
-    test_mask = [
-        (m, t) in test_market_timestamps 
-        for m, t in zip(full_df["market_id"], full_df["timestamp"])
-    ]
+    # Fast boolean indexing instead of list comprehension over tuples
+    full_df["_id_ts"] = full_df["market_id"].astype(str) + "_" + full_df["timestamp"].astype(str)
+    test_set = set(test_df["market_id"].astype(str) + "_" + test_df["timestamp"].astype(str))
+    test_mask = full_df["_id_ts"].isin(test_set).to_numpy()
 
     p_test = test_df["price"].to_numpy()
     tau_test = test_df["days_to_resolution"].to_numpy()
@@ -93,7 +83,6 @@ def predict_h2_all_models(
     )
     full_h2_garch_as = vm.garch_dr_as_h2(full_df, garch_as_params, spread_col=spread_col)
     h2_GARCH_AS = full_h2_garch_as.to_numpy()[test_mask]
-    # print(f"[Debug] Estimated K = {K_hat:.6f} | Spread mean = {test_df['spread'].mean():.4f}") # debug for K values
 
     # Apply global numerical floor safeguard
     return {
@@ -107,27 +96,29 @@ def predict_h2_all_models(
 def evaluate_walk_forward(
     df: pd.DataFrame, 
     spread_col: str = "spread", 
-    z_95: float = 1.96
+    z_95: float = 1.96,
+    lookback_periods: int = 12
 ) -> pd.DataFrame:
-    """Runs expanding-window walk-forward benchmark across available markets."""
+    """Runs rolling-window walk-forward benchmark across available markets."""
     df = df.copy()
     
     # 1. Parse timestamps safely (handling Unix epoch seconds vs ms vs string datetimes)
     if pd.api.types.is_numeric_dtype(df["timestamp"]):
-        # Check if timestamps are in milliseconds (> 1e11) vs seconds
         unit = "ms" if df["timestamp"].iloc[0] > 1e11 else "s"
         df["datetime"] = pd.to_datetime(df["timestamp"], unit=unit, errors="coerce")
     else:
         df["datetime"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
-    # Drop any unparseable rows
+    # Drop any unparseable rows and sort
     df = df.dropna(subset=["datetime"]).sort_values(["market_id", "datetime"]).reset_index(drop=True)
 
-    # 2. Try Monthly splits first; fall back to Weekly or 14-day splits if span is short
+    # 2. Pre-calculate 1-bar price changes (actual_dp) vector-wide to avoid loop overhead
+    df["actual_dp"] = df.groupby("market_id")["price"].diff().fillna(0.0)
+
+    # 3. Try Monthly splits first; fall back to Weekly if span is short
     df["period"] = df["datetime"].dt.to_period("M")
     unique_periods = sorted(df["period"].unique())
 
-    # Fallback to Weekly windows if dataset spans less than 2 distinct months
     if len(unique_periods) < 2:
         print("[Notice] Dataset spans less than 2 full calendar months. Falling back to weekly evaluation splits...")
         df["period"] = df["datetime"].dt.to_period("W")
@@ -139,13 +130,24 @@ def evaluate_walk_forward(
             f"Found only {len(unique_periods)} period(s) from {df['datetime'].min()} to {df['datetime'].max()}."
         )
 
+    # 4. Optimization: Filter to only keep markets with >= 24 bars total across the panel
+    # to avoid trivial cross-sections that get filtered out anyway.
+    market_counts = df.groupby("market_id").size()
+    valid_markets = market_counts[market_counts >= 24].index
+    df = df[df["market_id"].isin(valid_markets)].copy()
+
     eval_records = []
 
-    # Expanding window: train on < T, evaluate on period T
+    # Rolling window loop: evaluate on period T using a fixed trailing lookback window
     for i in range(1, len(unique_periods)):
         eval_period = unique_periods[i]
-        train_df = df[df["period"] < eval_period].copy()
-        test_df = df[df["period"] == eval_period].copy()
+        
+        # Restrict training data to fixed lookback horizon before eval_period
+        start_idx = max(0, i - lookback_periods)
+        valid_training_periods = unique_periods[start_idx:i]
+        
+        train_df = df[df["period"].isin(valid_training_periods)]
+        test_df = df[df["period"] == eval_period]
 
         if len(train_df) < 50 or len(test_df) == 0:
             continue
@@ -155,12 +157,16 @@ def evaluate_walk_forward(
             f"Train: {len(train_df):,} bars | Test: {len(test_df):,} bars..."
         )
 
-        # Get actual 1-bar price changes
-        test_df["actual_dp"] = test_df.groupby("market_id")["price"].diff().fillna(0.0)
         actual_dp = test_df["actual_dp"].to_numpy()
 
         # Compute predictions across all 4 models
         h2_preds = predict_h2_all_models(train_df, test_df, spread_col=spread_col)
+
+        # Vectorized metrics construction for this period
+        timestamps = test_df["datetime"].to_numpy()
+        market_ids = test_df["market_id"].to_numpy()
+        categories = test_df["category"].to_numpy() if "category" in test_df.columns else np.array(["Uncategorized"] * len(test_df))
+        volumes = test_df["volume"].to_numpy() if "volume" in test_df.columns else np.zeros(len(test_df))
 
         for model_name, h2_arr in h2_preds.items():
             sigma = np.sqrt(h2_arr)
@@ -168,17 +174,18 @@ def evaluate_walk_forward(
             upper = z_95 * sigma
             winkler = compute_winkler_score(actual_dp, lower, upper)
 
-            for idx, (_, row) in enumerate(test_df.iterrows()):
+            # Build record blocks efficiently using list comprehension / column arrays
+            for j in range(len(test_df)):
                 eval_records.append({
-                    "timestamp": row["datetime"],
-                    "market_id": row["market_id"],
-                    "category": row.get("category", "Uncategorized"),
-                    "volume": row.get("volume", 0.0),
+                    "timestamp": timestamps[j],
+                    "market_id": market_ids[j],
+                    "category": categories[j],
+                    "volume": volumes[j],
                     "model": model_name,
-                    "actual_dp": actual_dp[idx],
-                    "lower_95": lower[idx],
-                    "upper_95": upper[idx],
-                    "winkler_score": winkler[idx],
+                    "actual_dp": actual_dp[j],
+                    "lower_95": lower[j],
+                    "upper_95": upper[j],
+                    "winkler_score": winkler[j],
                 })
 
     return pd.DataFrame(eval_records)
@@ -191,7 +198,6 @@ def summarize_results(eval_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         vol_sum = group["volume"].sum()
         winkler = group["winkler_score"].to_numpy()
         
-        # Volume-Weighted Winkler Score fallback
         if vol_sum > 0 and not np.isnan(vol_sum):
             vw_winkler = float(np.average(winkler, weights=group["volume"]))
         else:
@@ -235,8 +241,8 @@ if __name__ == "__main__":
 
     print(f"Successfully loaded dataset with {len(df):,} total bars.")
 
-    # Execute benchmark
-    eval_df = evaluate_walk_forward(df, spread_col="spread")
+    # Execute rolling benchmark (defaulting to a trailing 12-period lookback window)
+    eval_df = evaluate_walk_forward(df, spread_col="spread", lookback_periods=12)
 
     # Display Summaries
     overall_sum, category_sum = summarize_results(eval_df)

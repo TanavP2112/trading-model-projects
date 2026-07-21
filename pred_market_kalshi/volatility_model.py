@@ -10,12 +10,73 @@ One-step conditional variance is decomposed into two additive channels:
 import numpy as np
 import pandas as pd
 from typing import Optional, Dict, Tuple, List
+from numba import njit  # Added Numba for high-performance JIT compilation
 
 EPS_P = 1e-4
 DEFAULT_MIN_TAU = 1.0 / 24.0    # Default floor: 1 hour (in days)
 DEFAULT_BAR_LENGTH = 1.0 / 24.0 # Default bar spacing: 1 hour (in days)
 
 
+# ---------------------------------------------------------------------------
+# Numba JIT-Compiled Fast Recursion Engine
+# ---------------------------------------------------------------------------
+@njit(fastmath=True)
+def _joint_h2_recursion_fast(
+    eps: np.ndarray, 
+    b: np.ndarray, 
+    omega: float, 
+    alpha: float,
+    beta: float, 
+    c: float, 
+    start_indices: np.ndarray,
+    end_indices: np.ndarray,
+    h2_ceiling: float
+) -> np.ndarray:
+    """
+    Compiled C-speed loop for the GARCH + DR-AS joint additive recursion:
+        h^2_t = omega + alpha * eps_{t-1}^2 + beta * h^2_{t-1} + c * max(b_{t-1}, 0)
+    """
+    n = len(eps)
+    h2 = np.empty(n, dtype=np.float64)
+    num_markets = len(start_indices)
+
+    for k in range(num_markets):
+        start = start_indices[k]
+        end = end_indices[k]
+        
+        # Initialize market boundary
+        init_val = b[start]
+        if init_val < 1e-12:
+            init_val = 1e-12
+        elif init_val > h2_ceiling:
+            init_val = h2_ceiling
+        h2[start] = init_val
+        
+        # Step through time series for current market
+        for t in range(start + 1, end):
+            prev_eps = eps[t - 1]
+            if not np.isfinite(prev_eps):
+                prev_eps = 0.0
+            
+            b_prev = b[t - 1]
+            if b_prev < 0.0:
+                b_prev = 0.0
+                
+            raw = omega + alpha * (prev_eps ** 2) + beta * h2[t - 1] + c * b_prev
+            
+            if raw < 1e-12:
+                h2[t] = 1e-12
+            elif raw > h2_ceiling:
+                h2[t] = h2_ceiling
+            else:
+                h2[t] = raw
+                
+    return h2
+
+
+# ---------------------------------------------------------------------------
+# Structural Components & Utility Functions
+# ---------------------------------------------------------------------------
 def dr_variance(
     p: np.ndarray, 
     tau: np.ndarray, 
@@ -105,6 +166,43 @@ def structural_h2(
     return h2
 
 
+# ---------------------------------------------------------------------------
+# Likelihood Function & Joint Fitting
+# ---------------------------------------------------------------------------
+def _neg_log_likelihood(
+    params: np.ndarray, 
+    eps: np.ndarray, 
+    dr: np.ndarray,
+    as_unit: np.ndarray,
+    valid_mask: np.ndarray,
+    start_indices: np.ndarray,
+    end_indices: np.ndarray,
+    h2_ceiling: float
+) -> float:
+    K, omega, alpha, beta, c = params
+    
+    # Fast boundary rejection
+    if K < 0 or omega < 0 or alpha < 0 or beta < 0 or c < 0 or (alpha + beta) >= 0.98:
+        return 1e10
+        
+    # Pre-calculated static components
+    b = dr + K * as_unit
+    
+    # Call Numba JIT loop
+    h2 = _joint_h2_recursion_fast(
+        eps, b, omega, alpha, beta, c, start_indices, end_indices, h2_ceiling
+    )
+    
+    h2_valid = h2[valid_mask]
+    eps_valid = eps[valid_mask]
+    
+    # Clip valid outputs for numerical evaluation
+    h2_valid = np.clip(h2_valid, 1e-12, None)
+    
+    ll = -0.5 * np.sum(np.log(2 * np.pi * h2_valid) + (eps_valid ** 2) / h2_valid)
+    return -ll if np.isfinite(ll) else 1e10
+
+
 def fit_garch_dr_as_joint(
     df: pd.DataFrame, 
     spread_col: Optional[str] = None,
@@ -115,38 +213,47 @@ def fit_garch_dr_as_joint(
     """
     Joint Quasi-MLE estimation of (K, omega, alpha, beta, c) on TRAIN data only.
     Filters out non-active updates during optimization for parameter stability.
-
-    constrain_c_zero=True forces c=0 (and K=0), yielding a PLAIN GARCH(1,1)
-    baseline with NO structural term -- h^2 = omega + alpha*eps^2 + beta*h^2.
-    This is the reviewer's 4th model ("GARCH"), the baseline that isolates
-    whether the STRUCTURAL variables add value OVER generic volatility
-    clustering. It shares this exact recursion/QMLE machinery, so plain-GARCH
-    vs GARCH+DR-AS is a clean apples-to-apples comparison (the latter just
-    frees c and K).
     """
     from scipy.optimize import minimize
 
     df_sorted = df.sort_values(["market_id", "timestamp"]).reset_index(drop=True)
-    eps = df_sorted.groupby("market_id")["price"].diff().to_numpy()
+    eps = df_sorted.groupby("market_id", sort=False)["price"].diff().to_numpy()
     p = df_sorted["price"].to_numpy()
     tau = df_sorted["days_to_resolution"].to_numpy()
     
-    volume = df_sorted["volume"].to_numpy() if (spread_col and spread_col in df_sorted.columns) else None
-    spread = df_sorted[spread_col].to_numpy() if (spread_col and spread_col in df_sorted.columns) else None
+    # 1. Pre-calculate static components ONCE outside optimization loop
+    dr = dr_variance(p, tau, min_tau=min_tau, bar_length=bar_length)
+    
+    if spread_col and spread_col in df_sorted.columns:
+        volume = df_sorted["volume"].to_numpy()
+        spread = df_sorted[spread_col].to_numpy()
+        spread_clean = np.clip(np.asarray(spread, dtype=float), 0.01, None)
+        as_unit = nu(volume) * (spread_clean ** 2) / 4.0
+    else:
+        as_unit = np.zeros_like(dr)
+
+    # 2. Extract flat integer boundary arrays for Numba
     boundaries = _market_boundaries(df_sorted["market_id"].to_numpy())
+    start_indices = np.array([b[0] for b in boundaries], dtype=np.int64)
+    end_indices = np.array([b[1] for b in boundaries], dtype=np.int64)
+
+    # 3. Pre-evaluate valid update mask
+    valid_mask = np.isfinite(eps) & (eps != 0)
+    
+    # Ceiling cap calculation
+    h2_ceiling = 25.0 * max(np.mean(dr[np.isfinite(dr)]), 1e-12)
 
     # Initial parameter guess
     x0 = np.array([0.0, 1e-6, 0.05, 0.80, 1.0])
-    args = (eps, p, tau, volume, spread, boundaries, min_tau, bar_length)
     bounds = [(0, None), (0, None), (0, 0.97), (0, 0.97), (0, None)]
 
     if constrain_c_zero:
-        # Pin both the structural scale c (index 4) and the AS scale K (index 0)
-        # to zero -> pure GARCH(1,1) with no prediction-market structure at all.
         x0[0] = 0.0
         x0[4] = 0.0
         bounds[0] = (0, 0)
         bounds[4] = (0, 0)
+
+    args = (eps, dr, as_unit, valid_mask, start_indices, end_indices, h2_ceiling)
 
     res = minimize(
         _neg_log_likelihood, 
@@ -154,7 +261,7 @@ def fit_garch_dr_as_joint(
         args=args, 
         method="L-BFGS-B", 
         bounds=bounds,
-        options={"maxiter": 200}
+        options={"maxiter": 200, "ftol": 1e-5}
     )
     
     K, omega, alpha, beta, c = res.x
@@ -169,10 +276,11 @@ def fit_garch_dr_as_joint(
         "neg_log_likelihood": float(res.fun),
     }
 
+
 def garch_dr_as_h2(
     df: pd.DataFrame, 
     params: dict, 
-    spread_col: str | None = None,
+    spread_col: Optional[str] = None,
     min_tau: float = DEFAULT_MIN_TAU, 
     bar_length: float = DEFAULT_BAR_LENGTH
 ) -> pd.Series:
@@ -181,21 +289,27 @@ def garch_dr_as_h2(
     the joint additive recursion on full or test DataFrames.
     """
     df_sorted = df.sort_values(["market_id", "timestamp"]).reset_index(drop=True)
-    eps = df_sorted.groupby("market_id")["price"].diff().to_numpy()
+    eps = df_sorted.groupby("market_id", sort=False)["price"].diff().to_numpy()
     p = df_sorted["price"].to_numpy()
     tau = df_sorted["days_to_resolution"].to_numpy()
     
     volume = df_sorted["volume"].to_numpy() if spread_col and spread_col in df_sorted.columns else None
     spread = df_sorted[spread_col].to_numpy() if spread_col and spread_col in df_sorted.columns else None
+    
     boundaries = _market_boundaries(df_sorted["market_id"].to_numpy())
+    start_indices = np.array([b[0] for b in boundaries], dtype=np.int64)
+    end_indices = np.array([b[1] for b in boundaries], dtype=np.int64)
 
     b = structural_h2(
         p, tau, volume=volume, spread=spread, K=params["K"],
         min_tau=min_tau, bar_length=bar_length
     )
-    h2 = _joint_h2_recursion(
+    
+    h2_ceiling = 25.0 * max(np.mean(b[np.isfinite(b)]), 1e-12)
+
+    h2 = _joint_h2_recursion_fast(
         eps, b, params["omega"], params["alpha"], params["beta"],
-        params["c"], boundaries
+        params["c"], start_indices, end_indices, h2_ceiling
     )
     
     result = pd.Series(h2, index=df_sorted.index)
@@ -211,55 +325,3 @@ def _market_boundaries(market_ids: np.ndarray) -> List[Tuple[int, int]]:
             boundaries.append((start, i))
             start = i
     return boundaries
-
-
-def _joint_h2_recursion(
-    eps: np.ndarray, 
-    b: np.ndarray, 
-    omega: float, 
-    alpha: float,
-    beta: float, 
-    c: float, 
-    boundaries: List[Tuple[int, int]],
-    h2_ceiling: Optional[float] = None
-) -> np.ndarray:
-    n = len(eps)
-    h2 = np.empty(n)
-    if h2_ceiling is None:
-        h2_ceiling = 25.0 * max(np.mean(b[np.isfinite(b)]), 1e-12)
-        
-    for start, end in boundaries:
-        h2[start] = min(max(b[start], 1e-12), h2_ceiling)
-        for t in range(start + 1, end):
-            prev_eps = eps[t - 1]
-            prev_eps = 0.0 if not np.isfinite(prev_eps) else prev_eps
-            raw = omega + alpha * (prev_eps ** 2) + beta * h2[t - 1] + c * max(b[t - 1], 0.0)
-            h2[t] = min(max(raw, 1e-12), h2_ceiling)
-    return h2
-
-
-def _neg_log_likelihood(
-    params: np.ndarray, 
-    eps: np.ndarray, 
-    p: np.ndarray, 
-    tau: np.ndarray,
-    volume: Optional[np.ndarray], 
-    spread: Optional[np.ndarray], 
-    boundaries: List[Tuple[int, int]],
-    min_tau: float, 
-    bar_length: float
-) -> float:
-    K, omega, alpha, beta, c = params
-    if K < 0 or omega < 0 or alpha < 0 or beta < 0 or c < 0 or (alpha + beta) >= 0.98:
-        return 1e10
-        
-    b = structural_h2(p, tau, volume=volume, spread=spread, K=K, min_tau=min_tau, bar_length=bar_length)
-    h2 = _joint_h2_recursion(eps, b, omega, alpha, beta, c, boundaries)
-    h2 = np.clip(h2, 1e-12, None)
-    
-    valid = np.isfinite(eps) & np.isfinite(h2) & (eps != 0)  # Filter inactive updates
-    if not np.any(valid):
-        return 1e10
-        
-    ll = -0.5 * np.sum(np.log(2 * np.pi * h2[valid]) + (eps[valid] ** 2) / h2[valid])
-    return -ll if np.isfinite(ll) else 1e10

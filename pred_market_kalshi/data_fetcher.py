@@ -1,178 +1,153 @@
 import os
+import re
 import numpy as np
 import pandas as pd
-from datasets import load_dataset
+import pyarrow.parquet as pq
+from huggingface_hub import snapshot_download
+import duckdb
 
 
 def assign_paper_category(ticker: str) -> str:
-    """Classifies Kalshi tickers into paper categories based on explicit prefixes."""
+    """Classifies Kalshi market tickers into 5 core academic categories.
+    Matches standard series prefixes (with optional 'KX' prefix).
+    """
     t = str(ticker).upper()
 
-    # 1. Sports (Check explicitly BEFORE general keyword matches)
-    sports_prefixes = [
-        "KXNBA",
-        "KXMLB",
-        "KXNFL",
-        "KXNHL",
-        "KXMLS",
-        "KXWNBA",
-        "KXSOCCER",
-        "KXATPMATCH",
-        "KXWTAMATCH",
-        "KXPGATOUR",
-        "KXTHEOPEN",
-        "KXF1RACE",
-        "KXF1",
-    ]
-    if any(t.startswith(p) for p in sports_prefixes):
+    # 1. Sports (Leagues, Majors, Tournaments, Player Props)
+    sports_pattern = (
+        r"^(KX)?(NBA|MLB|NFL|NHL|MLS|WNBA|SOCCER|ATP|WTA|PGA|THEOPEN|"
+        r"GOLF|TENNIS|EPL|UFC|BOXING|NASCAR|NCAAB|NCAAF|MASTERS|"
+        r"WIMBLEDON|USOPEN|HIGHLAX|WWOMENSINGLES|WMENSINGLES)"
+    )
+    if re.search(sports_pattern, t):
         return "Sports"
 
-    # 2. Crypto
-    crypto_prefixes = ["KXBTCD", "KXETHD", "KXBTC", "KXETH", "KXSOL", "KXCRYPTO"]
-    if any(t.startswith(p) for p in crypto_prefixes):
+    # 2. Crypto (Tokens, Industry, ETF approvals)
+    crypto_pattern = r"^(KX)?(BTC|ETH|SOL|DOGE|XRP|AVAX|CRYPTO|BITCOIN)"
+    if re.search(crypto_pattern, t):
         return "Crypto"
 
     # 3. Entertainment & Culture
-    ent_prefixes = [
-        "KXRT",
-        "KXNETFLIX",
-        "KXBOXOFFICE",
-        "KXOSCARS",
-        "KXGRAMMY",
-        "KXEMMY",
-        "KXTOPALBUM",
-    ]
-    if any(t.startswith(p) for p in ent_prefixes):
+    ent_pattern = (
+        r"^(KX)?(RT|NETFLIX|BOXOFFICE|OSCARS|GRAMMY|EMMY|TOPALBUM|TONY|"
+        r"GOLDENGLOBE|SPOTIFY|CONNSMYTHE|SQUIDGAMES|1SONG)"
+    )
+    if re.search(ent_pattern, t):
         return "Entertainment"
 
-    # 4. Politics & Elections (Check prefix to avoid matching inside player names)
-    pol_prefixes = [
-        "KXPOL",
-        "KXCONGRESS",
-        "KXGOV",
-        "KXSENATE",
-        "KXELECTION",
-        "KXPRES",
-        "KXPRIMARY",
-        "KXSTATEMENT",
-    ]
-    if any(t.startswith(p) for p in pol_prefixes):
+    # 4. Politics & Government (Elections, Appointments, Congress)
+    pol_pattern = (
+        r"^(KX)?(POL|CONGRESS|GOV|SENATE|ELECTION|PRES|PRIMARY|STATEMENT|"
+        r"SCOTUS|CABINET|APPROVAL|MAYOR|HOUSE|NYCMAYOR|NYCBOROUGH|TRUMPMENTION)"
+    )
+    if re.search(pol_pattern, t):
         return "Politics"
 
-    # 5. Economics & Macro (Default fallback)
+    # 5. Economics & Macro (Default fallback: CPI, FED, GDP, Jobless Claims, Rates)
     return "Economics"
 
 
 def resample_and_ffill_markets(df: pd.DataFrame) -> pd.DataFrame:
-    """Groups data by market_id, creates an unbroken hourly grid for each market,
+    """Groups data by market_id and creates an unbroken hourly grid per market
 
-    and forward-fills prices and metadata to eliminate time gaps.
+    using vectorized pandas resampling to improve performance on large datasets.
     """
     print("[Info] Resampling and forward-filling hourly grid per market...")
 
-    filled_dfs = []
     time_col = "datetime" if "datetime" in df.columns else "timestamp"
 
-    for market_id, group in df.groupby("market_id"):
-        # Set datetime/timestamp index and sort
-        group = group.set_index(time_col).sort_index()
+    # Vectorized GroupBy + Resample across markets
+    resampled = (
+        df.set_index(time_col)
+        .groupby("market_id")
+        .resample("1h")
+        .agg({"price": "last", "volume": "sum"})
+    )
 
-        # 1. Aggregate duplicate trades within the same hour
-        hourly = group.resample("1h").agg({"price": "last", "volume": "sum"})
+    # Forward-fill price per market to bridge inactive/quiet hours
+    resampled["price"] = (
+        resampled.groupby("market_id")["price"].ffill().bfill()
+    )
 
-        # 2. Forward-fill price across quiet hours (last known price carries forward)
-        hourly["price"] = hourly["price"].ffill().bfill()
+    # Fill empty volume bars with 0.0 (no trades occurred)
+    resampled["volume"] = resampled["volume"].fillna(0.0)
 
-        # 3. Fill missing volume with 0 (no trades occurred in gap hours)
-        hourly["volume"] = hourly["volume"].fillna(0.0)
-
-        # 4. Re-attach market_id
-        hourly["market_id"] = market_id
-
-        filled_dfs.append(hourly.reset_index())
-
-    # Combine back into a single panel DataFrame
-    panel_df = pd.concat(filled_dfs, ignore_index=True)
-
-    # Standardize output timestamp column name
-    if "index" in panel_df.columns:
-        panel_df = panel_df.rename(columns={"index": "timestamp"})
-    elif "datetime" in panel_df.columns:
-        panel_df = panel_df.rename(columns={"datetime": "timestamp"})
+    panel_df = resampled.reset_index()
+    panel_df.rename(columns={time_col: "timestamp"}, inplace=True)
 
     return panel_df
 
 
 def build_panel_from_hf_dataset(
-    repo_id: str = "thomaswmitch/kalshi-prediction-markets-betting",
-    min_hourly_bars: int = 24,
-    max_rows: int = 3_000_000,
+    repo_id: str = "TrevorJS/kalshi-trades",
+    min_hourly_bars: int = 24
 ) -> pd.DataFrame:
-    print(f"[Info] Loading Hugging Face dataset '{repo_id}'...")
-    ds = load_dataset(repo_id, split="train")
+    print(f"[Info] Downloading/verifying dataset files locally for '{repo_id}'...")
+    
+    # 1. Download parquet files to HF local cache with retry handling
+    # snapshot_download handles rate-limits, resume-on-failure, and local caching automatically
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        allow_patterns="trades-*.parquet",
+        max_workers=4  # Limit concurrent workers to prevent triggering HF rate limits
+    )
 
-    if max_rows and len(ds) > max_rows:
-        print(
-            f"[Info] Sampling top {max_rows:,} rows for rapid prototyping..."
-        )
-        df = ds.select(range(max_rows)).to_pandas()
-    else:
-        df = ds.to_pandas()
+    local_pattern = os.path.join(local_dir, "trades-*.parquet").replace("\\", "/")
+    print(f"[Info] Streaming and aggregating local Parquet files via DuckDB: {local_pattern}")
 
-    print(f"[Info] Loaded {len(df):,} raw trades. Formatting schema...")
+    # 2. Execute DuckDB aggregation over local disk files (100% immune to HTTP 429)
+    query = f"""
+    WITH raw_trades AS (
+        SELECT 
+            ticker AS market_id,
+            created_time AS timestamp,
+            yes_price / 100.0 AS price,
+            CAST(count AS DOUBLE) AS volume
+        FROM '{local_pattern}'
+    ),
+    hourly_grid AS (
+        SELECT 
+            market_id,
+            time_bucket(INTERVAL '1 hour', timestamp) AS timestamp,
+            LAST(price) AS price,
+            SUM(volume) AS volume
+        FROM raw_trades
+        GROUP BY market_id, time_bucket(INTERVAL '1 hour', timestamp)
+    )
+    SELECT * FROM hourly_grid
+    """
 
-    # 1. Safely locate ticker column without creating duplicated columns
-    ticker_col = None
-    for candidate in ["market_ticker", "ticker", "market_id"]:
-        if candidate in df.columns:
-            ticker_col = candidate
-            break
+    df_hourly = duckdb.query(query).df()
+    print(f"[Info] Aggregated into {len(df_hourly):,} hourly bars! Cleaning panel...")
 
-    if not ticker_col:
-        raise KeyError("Could not find a valid ticker column in dataset.")
+    # 3. Sort and Forward-Fill Prices per Market
+    df_hourly.sort_values(["market_id", "timestamp"], inplace=True)
+    df_hourly["price"] = (
+        df_hourly.groupby("market_id")["price"].ffill().bfill()
+    )
+    df_hourly["volume"] = df_hourly["volume"].fillna(0.0)
 
-    df["market_id"] = df[ticker_col].astype(str)
-
-    # 2. Standardize timestamp and volume columns
-    time_col = "created_time" if "created_time" in df.columns else "datetime"
-    vol_col = "count" if "count" in df.columns else "volume"
-
-    df["datetime"] = pd.to_datetime(df[time_col], utc=True)
-    df["volume"] = df[vol_col].astype(float) if vol_col in df.columns else 1.0
-
-    # 3. Convert integer cents (1-99) to probabilities (0.01-0.99)
-    if "yes_price" in df.columns:
-        df["price"] = df["yes_price"].astype(float) / 100.0
-    elif "price" in df.columns:
-        df["price"] = df["price"].astype(float)
-        if df["price"].max() > 1.0:
-            df["price"] = df["price"] / 100.0
-
-    # Clean up duplicate columns to guarantee 1D Series for GroupBy
-    df = df.loc[:, ~df.columns.duplicated()].copy()
-
-    # 4. Resample and forward-fill on continuous 1-hour grids per market
-    df_hourly = resample_and_ffill_markets(df)
-
-    # 5. Calculate time to resolution proxy
+    # 4. Time to Resolution Proxy (tau in days)
     max_ts = df_hourly.groupby("market_id")["timestamp"].transform("max")
     tau_days = (max_ts - df_hourly["timestamp"]).dt.total_seconds() / 86400.0
     df_hourly["days_to_resolution"] = np.maximum(tau_days, 1.0 / 24.0)
 
-    # 6. Add category mapping & default spread
+    # 5. Category & Spread
     df_hourly["category"] = df_hourly["market_id"].apply(assign_paper_category)
     df_hourly["spread"] = 0.01
 
-    # 7. Filter out illiquid markets with too few bars
+    # 6. Filter Illiquid Markets
     counts = df_hourly.groupby("market_id").size()
     valid_markets = counts[counts >= min_hourly_bars].index
     df_hourly = df_hourly[df_hourly["market_id"].isin(valid_markets)].copy()
 
-    df_hourly.sort_values(["market_id", "timestamp"], inplace=True)
     df_hourly.reset_index(drop=True, inplace=True)
 
-    # Save to local cache
+    # Cache local panel
+    os.makedirs("data", exist_ok=True)
     df_hourly.to_parquet("data/kalshi_hf_panel.parquet")
+
     print(
         f"[Success] Built panel with {len(df_hourly):,} hourly bars across"
         f" {df_hourly['market_id'].nunique()} markets!"
@@ -181,5 +156,5 @@ def build_panel_from_hf_dataset(
 
 
 if __name__ == "__main__":
-    # Test execution
+    # Test execution across full dataset
     build_panel_from_hf_dataset(min_hourly_bars=24)
