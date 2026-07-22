@@ -31,6 +31,8 @@ The data was constructed from `TrevorJS/kalshi-trades` (HuggingFace), Kalshi's p
 
 **Phase 2 — Trading signal tests.** Vol-normalized momentum shows Sharpe ratios of −8.9 to −3.9 across four fixed holding periods (1/6/12/24h) on ~43k out-of-sample trades. Vol-normalized reversal shows an apparent positive Sharpe that a pooled-vs-fold-averaged diagnostic traces to single-event concentration (an early version of the panel showed a pooled Sharpe of +15 at H=6h driven almost entirely by November 2024 election contracts; after tightening the panel to match the paper's filtering conventions, the same signal's Sharpe collapsed to +2.4). ~349k out-of-sample trades total across four strategies and four horizons.
 
+**Note About the drawdown results:** Some of the results seem laughably absurd (46000% Drawdown?), but the intepretatation matters here. A drawdown of greater than 1 states that if you deployed this strategy (assuming the $100,000 nominal bankroll), not only would you end up with 0 equity, you would actually **blow past it**. This suggests that the strategy is well worth avoiding
+
 ---
 
 ## Methodology
