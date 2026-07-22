@@ -1,327 +1,255 @@
-"""
-Backtest engine for the momentum/reversal prediction-market strategy.
-
-Pipeline:
-  1. Generate ONE candidate trade per (market, strategy) at the first bar
-     where the signal crosses a minimum candidate threshold, subject to
-     liquidity + time-to-resolution filters.
-  2. Split markets chronologically into TRAIN / TEST (no shuffling --
-     this is a time series; shuffling would leak future information
-     into calibration).
-  3. On TRAIN only: bucket candidate trades into signal deciles and
-     empirically measure win rate + average entry price per bucket.
-     Convert each bucket's edge into a capped, fractional-Kelly position
-     size. This calibration is FROZEN before touching TEST.
-  4. On TEST: apply the frozen calibration (bucket boundaries + sizing)
-     to size and simulate each trade, including Polymarket's actual fee
-     formula and an assumed spread cost. Trades with a non-positive
-     calibrated edge are sized at 0 (skipped).
-  5. Report BOTH a daily-aggregated Sharpe and a trade-level Sharpe --
-     see the warning in `compute_metrics` for why these can diverge a
-     lot for a strategy that doesn't trade every single day.
-"""
-
-from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
-from fees import taker_fee
-from config import (MIN_VOLUME_USD, MIN_DAYS_TO_RESOLUTION, MAX_POSITION_FRACTION,
-                     KELLY_FRACTION, ANNUALIZATION_DAYS, ASSUMED_SPREAD_COST)
-
-N_DECILES = 10
-CANDIDATE_MIN_MOM = 0.30     # minimum |logit move| to even consider a momentum trade
-CANDIDATE_MIN_REV = 1.00     # minimum |z-score| to even consider a reversal trade
-CANDIDATE_MIN_STRUCT_MOM = 1.50   # structural signals are proper z-scores, so thresholds
-CANDIDATE_MIN_STRUCT_REV = 0.75   # here are ordinary z-critical-values -- BUT momentum and
-# reversal z-scores have genuinely different typical scales (momentum measures a cumulative
-# move over the whole window, reversal measures a point deviation from the local mean, which
-# is inherently smaller), so the same absolute threshold is NOT equally selective for both.
-# These two values were set by checking each signal's own empirical quantiles on the demo
-# panel (see README) to land at roughly the same selectivity (~top 3%) for both -- if you
-# change lookback windows or move to real data, re-check panel['struct_*_signal'].abs()
-# .quantile([0.9,0.95,0.99]) rather than assuming these fixed numbers still make sense.
-CANDIDATE_MIN_STRUCT_MOM_GARCH = 1.50   # GARCH-combined variants -- placeholder values,
-CANDIDATE_MIN_STRUCT_REV_GARCH = 0.75   # RE-CHECK against their own empirical quantiles too
-# (the GARCH multiplier changes the denominator's scale, so there's no guarantee the DR-AS-only
-# thresholds above happen to still be well-calibrated for the GARCH-combined signal versions).
-BANKROLL = 100_000.0         # nominal bankroll for dollar-denominated reporting
+from config import (
+    MAX_POSITION_FRACTION, MIN_VOLUME_USD,
+    MIN_DAYS_TO_RESOLUTION, ANNUALIZATION_DAYS,
+)
+from fees import calculate_kalshi_taker_fee
 
 
-@dataclass
-class Trade:
-    market_id: int
-    category: str
-    entry_ts: pd.Timestamp
-    strategy: str          # "momentum" or "reversal"
-    direction: int          # +1 = bet YES, -1 = bet NO
-    signal_value: float
-    entry_price_for_bet: float   # price paid per share of the side we bought
-    outcome: int
-    win: int
-    position_fraction: float     # fraction of bankroll risked (0 if skipped)
-    pnl_dollars: float
+BANKROLL = 100_000.0
+DEFAULT_HOLDING_HOURS = [1, 6, 12, 24]
+DEFAULT_ENTRY_THRESHOLD = 1.5   # |z| for vol-normalized signals to fire
+DEFAULT_ENTRY_FRAC = 0.01       # 1% of bankroll per trade
+
+def _shift_signal_causally(df: pd.DataFrame, signal_col: str) -> pd.Series:
+    return df.groupby("market_id")[signal_col].shift(1)
 
 
-def _first_candidate_per_market(df: pd.DataFrame, signal_col: str, min_abs: float) -> pd.DataFrame:
-    """One row per market: the first bar where |signal| >= min_abs and filters pass."""
-    ok = df["tradeable"] & (df[signal_col].abs() >= min_abs)
-    cand = df[ok].sort_values(["market_id", "timestamp"])
-    return cand.groupby("market_id", as_index=False).first()
+def _future_price(df: pd.DataFrame, horizon: int) -> pd.Series:
+    return df.groupby("market_id")["price"].shift(-horizon)
 
 
-# Strategy -> (signal column, direction sign convention, fallback fixed threshold).
-# The fallback thresholds below are ONLY used if adaptive thresholding (see
-# compute_adaptive_threshold) can't be computed (e.g. too little train data) --
-# they are NOT meant to be trusted as-is on new data. This is the fix for a
-# real bug found by reproducing it: h^2 = p(1-p)/tau is regime-dependent on
-# typical time-to-resolution. Long-duration markets (tau usually >> 1) give
-# small h^2 and therefore LARGER z-scores for the same raw move; short-
-# duration markets (tau often near the min_tau floor) give h^2 close to its
-# max (~0.25) and therefore much SMALLER z-scores for the same raw move. A
-# fixed threshold calibrated on one duration regime can silently produce
-# ZERO candidates on another -- confirmed by direct reproduction: on a
-# short-duration synthetic panel, the MAXIMUM struct_mom_signal value
-# observed was 0.24, against a fixed threshold of 1.50.
-_STRUCTURAL_STRATEGIES = {
-    "structural_momentum": ("struct_mom_signal", 1, 1.50),
-    "structural_reversal": ("struct_rev_signal", -1, 0.75),
-    "structural_momentum_garch": ("struct_mom_garch_signal", 1, 1.50),
-    "structural_reversal_garch": ("struct_rev_garch_signal", -1, 0.75),
-    "structural_momentum_jointgarch": ("struct_mom_jointgarch_signal", 1, 1.50),
-    "structural_reversal_jointgarch": ("struct_rev_jointgarch_signal", -1, 0.75),
-}
-ADAPTIVE_PERCENTILE = 97.0   # target selectivity: top ~3% of |signal| on TRAIN data
+def _sign_by_signal(signal_col: str) -> int:
+    if "mom" in signal_col:
+        return +1
+    if "rev" in signal_col:
+        return -1
+    return +1
 
 
-def compute_adaptive_thresholds(df: pd.DataFrame, train_market_ids: set,
-                                 percentile: float = ADAPTIVE_PERCENTILE) -> dict:
-    """
-    Derive each structural strategy's candidate threshold from the ACTUAL
-    empirical distribution of that signal on TRAIN markets only (never test
-    -- this is a threshold-selection decision, and letting test data
-    influence it would be a subtle form of look-ahead leakage, same
-    discipline as K-fitting and Kelly calibration elsewhere in this file).
-
-    Falls back to the fixed reference value in _STRUCTURAL_STRATEGIES if a
-    signal has too few valid (finite, non-null) train observations to
-    compute a percentile reliably.
-    """
-    train_df = df[df["market_id"].isin(train_market_ids)]
-    thresholds = {}
-    for strategy, (col, _sign, fallback) in _STRUCTURAL_STRATEGIES.items():
-        if col not in train_df.columns:
-            thresholds[strategy] = fallback
-            continue
-        vals = train_df[col].replace([np.inf, -np.inf], np.nan).dropna().abs()
-        if len(vals) < 30:
-            thresholds[strategy] = fallback
-        else:
-            thresholds[strategy] = float(np.percentile(vals, percentile))
-    return thresholds
+def _fees(entry_price: float, exit_price: float, shares: float) -> float:
+    """Round-trip Kalshi taker fees at entry and exit."""
+    return (calculate_kalshi_taker_fee(entry_price, shares)
+            + calculate_kalshi_taker_fee(exit_price, shares))
 
 
-def build_candidates(df: pd.DataFrame, strategy: str, adaptive_thresholds: dict | None = None) -> pd.DataFrame:
-    df = df.copy()
-    df["tradeable"] = (df["volume"] >= MIN_VOLUME_USD) & (df["days_to_resolution"] >= MIN_DAYS_TO_RESOLUTION)
+def generate_trades(
+    df: pd.DataFrame,
+    signal_col: str,
+    horizon_hours: int,
+    entry_threshold: float = DEFAULT_ENTRY_THRESHOLD,
+    entry_frac: float = DEFAULT_ENTRY_FRAC,
+    min_volume: float = MIN_VOLUME_USD,
+    min_days_to_resolution: float = MIN_DAYS_TO_RESOLUTION,
+    bankroll: float = BANKROLL,
+) -> pd.DataFrame:
+    df = df.sort_values(["market_id", "timestamp"]).reset_index(drop=True).copy()
+    df["_signal"] = _shift_signal_causally(df, signal_col) if signal_col != "unconditional" else 1.0
+    df["_exit_price"] = _future_price(df, horizon_hours)
 
-    if strategy == "momentum":
-        cand = _first_candidate_per_market(df, "mom_signal", CANDIDATE_MIN_MOM)
-        cand["signal_value"] = cand["mom_signal"]
-        cand["direction"] = np.sign(cand["signal_value"]).astype(int)     # bet WITH the move
-    elif strategy == "reversal":
-        cand = _first_candidate_per_market(df, "rev_signal", CANDIDATE_MIN_REV)
-        cand["signal_value"] = cand["rev_signal"]
-        cand["direction"] = -np.sign(cand["signal_value"]).astype(int)    # FADE the extension
-    elif strategy in _STRUCTURAL_STRATEGIES:
-        col, sign, fallback = _STRUCTURAL_STRATEGIES[strategy]
-        min_abs = (adaptive_thresholds or {}).get(strategy, fallback)
-        cand = _first_candidate_per_market(df, col, min_abs)
-        cand["signal_value"] = cand[col]
-        cand["direction"] = (sign * np.sign(cand["signal_value"])).astype(int)
-    else:
-        raise ValueError(strategy)
-
-    cand = cand[cand["direction"] != 0].copy()
-    # price paid per share of the side we actually bought (YES side price if direction=+1, else NO side price)
-    cand["entry_price_for_bet"] = np.where(cand["direction"] == 1, cand["price"], 1 - cand["price"])
-    cand["win"] = np.where(cand["direction"] == 1, cand["outcome"], 1 - cand["outcome"]).astype(int)
-    cand["raw_edge"] = cand["win"] - cand["entry_price_for_bet"]
-    return cand
-
-
-
-
-def train_test_split_by_market(df: pd.DataFrame, train_frac: float = 0.65):
-    market_start = df.groupby("market_id")["timestamp"].min().sort_values()
-    n_train = int(len(market_start) * train_frac)
-    train_ids = set(market_start.index[:n_train])
-    test_ids = set(market_start.index[n_train:])
-    return df[df["market_id"].isin(train_ids)].copy(), df[df["market_id"].isin(test_ids)].copy()
-
-
-def calibrate_on_train(train_cand: pd.DataFrame):
-    """
-    Bucket TRAIN candidate trades into deciles of signed signal_value,
-    return (bin_edges, calibration_table) where calibration_table maps
-    bucket index -> capped fractional-Kelly position size.
-    """
-    if len(train_cand) < N_DECILES * 3:
-        # too few trades to calibrate deciles reliably -- fall back to one bucket
-        bins = 1
-    else:
-        bins = N_DECILES
-
-    train_cand = train_cand.copy()
-    signal = train_cand["signal_value"].replace([np.inf, -np.inf], np.nan)
-
-    bin_edges = np.array([-np.inf, np.inf])
-    if signal.notna().sum() >= 2:
-        try:
-            _, raw_edges = pd.qcut(signal, bins, retbins=True, duplicates="drop")
-            # Defensive: explicitly dedupe + sort regardless of what qcut claims to
-            # have already done. This is what actually prevents "bins must increase
-            # monotonically" -- qcut's own duplicate-handling can still leave edges
-            # that are distinct-but-numerically-adjacent in ways that cause trouble
-            # downstream, and on messier real-world data (price ties from cent-level
-            # quantization, sparse candidate counts) this class of edge case shows up
-            # far more than it ever did on the smooth synthetic generator.
-            raw_edges = np.unique(raw_edges[np.isfinite(raw_edges)])
-            if len(raw_edges) >= 2:
-                bin_edges = raw_edges.copy()
-                bin_edges[0] = -np.inf   # extend outer edges so no real value falls outside
-                bin_edges[-1] = np.inf
-        except ValueError:
-            pass  # keep the [-inf, inf] single-bucket fallback
-
-    # Recompute buckets via the SAME pd.cut() call apply_calibration_to_test() will
-    # use on test data, instead of trusting qcut's own (separately-derived) bucket
-    # labels -- guarantees train and test use identical, internally-consistent
-    # bucketing logic rather than two independently-computed binning paths that could
-    # disagree at the margins.
-    train_cand["bucket"] = pd.cut(signal, bins=bin_edges, labels=False, include_lowest=True)
-
-    calib = {}
-    for b, g in train_cand.groupby("bucket"):
-        q = g["win"].mean()
-        c = g["entry_price_for_bet"].mean()
-        n = len(g)
-        c = np.clip(c, 0.02, 0.98)
-        kelly_full = q - (1 - q) * c / (1 - c)
-        kelly_sized = max(kelly_full, 0.0) * KELLY_FRACTION
-        kelly_sized = min(kelly_sized, MAX_POSITION_FRACTION)
-        se = np.sqrt(max(c * (1 - c), 1e-6) / max(n, 1))
-        z_stat = (q - c) / se if se > 0 else 0.0
-        if n < 15 or z_stat < 1.96:
-            kelly_sized = 0.0
-
-        calib[int(b)] = {"win_rate": q, "avg_price": c, "n_train": n,
-                          "z_stat": z_stat, "position_fraction": kelly_sized}
-    return bin_edges, calib
-
-
-def apply_calibration_to_test(test_cand: pd.DataFrame, bin_edges: np.ndarray, calib: dict,
-                               strategy: str, category_fee_map) -> list[Trade]:
-    trades = []
-    if len(bin_edges) < 2:
-        return trades
-
-    signal = test_cand["signal_value"].replace([np.inf, -np.inf], np.nan)
-    try:
-        buckets = pd.cut(signal, bins=bin_edges, labels=False, include_lowest=True)
-    except ValueError as e:
-        # Last-resort safety net: one strategy's calibration hiccup shouldn't crash
-        # the whole run. Print loudly (this should be rare after the fix in
-        # calibrate_on_train) rather than fail silently.
-        print(f"  !! apply_calibration_to_test('{strategy}'): pd.cut failed ({e}); "
-              f"skipping this strategy's test trades. bin_edges={bin_edges}")
-        return trades
-
-    for (_, row), bucket in zip(test_cand.iterrows(), buckets):
-        info = calib.get(int(bucket), None) if pd.notna(bucket) else None
-        frac = info["position_fraction"] if info else 0.0
-        if frac <= 0:
-            continue
-        stake = frac * BANKROLL
-        entry_p = row["entry_price_for_bet"]
-        shares = stake / entry_p
-        fee = taker_fee(entry_p, shares, row["category"])
-        spread = shares * ASSUMED_SPREAD_COST
-        gross_pnl = shares * (row["win"] - entry_p)
-        net_pnl = gross_pnl - fee - spread
-        trades.append(Trade(
-            market_id=row["market_id"], category=row["category"], entry_ts=row["timestamp"],
-            strategy=strategy, direction=int(row["direction"]), signal_value=row["signal_value"],
-            entry_price_for_bet=entry_p, outcome=int(row["outcome"]), win=int(row["win"]),
-            position_fraction=frac, pnl_dollars=net_pnl,
-        ))
-    return trades
-
-
-def run_strategy(df: pd.DataFrame, strategy: str, train_frac: float = 0.65,
-                  adaptive_percentile: float = ADAPTIVE_PERCENTILE):
-    train_df, test_df = train_test_split_by_market(df, train_frac)
-    train_ids = set(train_df["market_id"])
-
-    adaptive_thresholds = None
-    if strategy in _STRUCTURAL_STRATEGIES:
-        # Threshold is derived from TRAIN data's own signal distribution only,
-        # then FROZEN and applied identically to both train and test candidate
-        # generation -- same discipline as every other calibrated parameter in
-        # this file (K, Kelly buckets, GARCH params). Computing it fresh per
-        # call (rather than trusting a hardcoded constant) is what actually
-        # fixes strategies going to zero candidates on data with a different
-        # typical h^2 scale than whatever the fixed thresholds were tuned on.
-        adaptive_thresholds = compute_adaptive_thresholds(df, train_ids, adaptive_percentile)
-
-    cand = build_candidates(df, strategy, adaptive_thresholds=adaptive_thresholds)
-    train_cand = cand[cand["market_id"].isin(train_ids)]
-    test_cand = cand[cand["market_id"].isin(set(test_df["market_id"]))]
-    bin_edges, calib = calibrate_on_train(train_cand)
-    trades = apply_calibration_to_test(test_cand, bin_edges, calib, strategy, None)
-    return trades, calib
-
-
-def trades_to_frame(trades: list[Trade]) -> pd.DataFrame:
-    if not trades:
+    horizon_days = horizon_hours / 24.0
+    fires = (
+        df["_signal"].abs() >= entry_threshold
+        if signal_col != "unconditional"
+        else pd.Series(True, index=df.index)
+    )
+    eligible = (
+        fires
+        & df["_exit_price"].notna()
+        & (df["volume"] >= min_volume)
+        & (df["days_to_resolution"] >= max(min_days_to_resolution, horizon_days))
+    )
+    hits = df[eligible].copy()
+    if hits.empty:
         return pd.DataFrame()
-    return pd.DataFrame([t.__dict__ for t in trades])
 
+    base_sign = _sign_by_signal(signal_col)
+    if signal_col == "unconditional":
+        direction = pd.Series(+1, index=hits.index)
+    else:
+        direction = base_sign * np.sign(hits["_signal"]).astype(int)
 
-def compute_metrics(trades_df: pd.DataFrame, bankroll: float = BANKROLL) -> dict:
-    if trades_df.empty:
-        return {"n_trades": 0}
+    entry_p = hits["price"].astype(float)
+    exit_p = hits["_exit_price"].astype(float)
 
-    trades_df = trades_df.sort_values("entry_ts")
-    trade_returns = trades_df["pnl_dollars"] / bankroll
+    # Cost per share: entry price if buying YES, (1 - entry) if buying NO.
+    cost_per_share_entry = np.where(direction > 0, entry_p, 1.0 - entry_p)
+    dollars_at_risk = entry_frac * bankroll
+    shares = dollars_at_risk / np.maximum(cost_per_share_entry, 0.01)
 
-    # --- Trade-level Sharpe (annualized by observed trade frequency) ---
-    span_days = max((trades_df["entry_ts"].max() - trades_df["entry_ts"].min()).days, 1)
-    trades_per_year = len(trades_df) / (span_days / 365.0)
-    trade_sharpe = (trade_returns.mean() / trade_returns.std(ddof=1)) * np.sqrt(trades_per_year) \
-        if trade_returns.std(ddof=1) > 0 else np.nan
+    pnl_per_share = direction.values * (exit_p.values - entry_p.values)
+    gross_pnl = pnl_per_share * shares
+    fees = np.array([
+        _fees(float(ep), float(xp), float(sh))
+        for ep, xp, sh in zip(entry_p, exit_p, shares)
+    ])
+    net_pnl = gross_pnl - fees
 
-    # --- Daily-aggregated Sharpe ---
-    daily = trades_df.groupby(trades_df["entry_ts"].dt.floor("D"))["pnl_dollars"].sum() / bankroll
-    full_idx = pd.date_range(daily.index.min(), daily.index.max(), freq="D")
-    daily = daily.reindex(full_idx, fill_value=0.0)
-    daily_sharpe = (daily.mean() / daily.std(ddof=1)) * np.sqrt(ANNUALIZATION_DAYS) \
-        if daily.std(ddof=1) > 0 else np.nan
+    return pd.DataFrame({
+        "market_id": hits["market_id"].values,
+        "category": hits.get("category", pd.Series(["Uncategorized"] * len(hits))).values,
+        "entry_ts": hits["timestamp"].values,
+        "exit_ts": (hits["timestamp"] + pd.to_timedelta(horizon_hours, unit="h")).values,
+        "horizon_hours": horizon_hours,
+        "signal_col": signal_col,
+        "signal_value": hits["_signal"].values,
+        "direction": direction.values,
+        "entry_price": entry_p.values,
+        "exit_price": exit_p.values,
+        "shares": shares,
+        "gross_pnl": gross_pnl,
+        "fees": fees,
+        "net_pnl": net_pnl,
+        "return_frac": net_pnl / bankroll,
+    })
 
-    equity = (1 + daily).cumprod()
+def compute_risk_stats(trades: pd.DataFrame, bankroll: float = BANKROLL) -> Dict[str, float]:
+    if trades.empty:
+        return {
+            "n_trades": 0, "n_markets": 0, "n_trading_days": 0,
+            "win_rate": np.nan, "total_pnl": 0.0, "mean_return": np.nan,
+            "daily_sharpe_annualized": np.nan, "daily_vol": np.nan,
+            "max_drawdown": np.nan, "turnover_per_day": np.nan,
+            "total_fees": 0.0, "sharpe_reliable": False,
+        }
+
+    tr = trades.copy()
+    tr["exit_date"] = pd.to_datetime(tr["exit_ts"]).dt.floor("D")
+    daily_pnl = tr.groupby("exit_date")["net_pnl"].sum().sort_index()
+    daily_ret = daily_pnl / bankroll
+    n_days = int(daily_ret.shape[0])
+
+    if n_days >= 2:
+        mu = float(daily_ret.mean())
+        sigma = float(daily_ret.std(ddof=1))
+        sharpe = mu / sigma * np.sqrt(ANNUALIZATION_DAYS) if sigma > 0 else np.nan
+    else:
+        mu, sigma, sharpe = np.nan, np.nan, np.nan
+
+    equity = bankroll + daily_pnl.cumsum()
     running_max = equity.cummax()
-    max_dd = ((equity - running_max) / running_max).min()
+    drawdown = (equity - running_max) / running_max
+    max_dd = float(drawdown.min()) if len(drawdown) else np.nan
+
+    turnover_per_day = float(tr["shares"].sum() / max(n_days, 1))
 
     return {
-        "n_trades": len(trades_df),
-        "win_rate": trades_df["win"].mean(),
-        "avg_pnl_per_trade": trades_df["pnl_dollars"].mean(),
-        "total_pnl": trades_df["pnl_dollars"].sum(),
-        "total_return_pct": 100 * trades_df["pnl_dollars"].sum() / bankroll,
-        "trade_level_sharpe": trade_sharpe,
-        "daily_aggregated_sharpe": daily_sharpe,
-        "max_drawdown_pct": 100 * max_dd,
-        "avg_position_fraction": trades_df["position_fraction"].mean(),
-        "equity_curve": equity,
+        "n_trades": int(len(tr)),
+        "n_markets": int(tr["market_id"].nunique()),
+        "n_trading_days": n_days,
+        "win_rate": float((tr["net_pnl"] > 0).mean()),
+        "total_pnl": float(tr["net_pnl"].sum()),
+        "mean_return": float(tr["return_frac"].mean()),
+        "daily_sharpe_annualized": float(sharpe) if not np.isnan(sharpe) else np.nan,
+        "daily_vol": sigma if not np.isnan(sigma) else np.nan,
+        "max_drawdown": max_dd,
+        "turnover_per_day": turnover_per_day,
+        "total_fees": float(tr["fees"].sum()),
+        "sharpe_reliable": bool(n_days >= 5),
+    }
+
+
+def by_category(trades: pd.DataFrame, bankroll: float = BANKROLL) -> pd.DataFrame:
+    if trades.empty or "category" not in trades.columns:
+        return pd.DataFrame()
+    rows = []
+    for cat, g in trades.groupby("category"):
+        stats = compute_risk_stats(g, bankroll=bankroll)
+        stats["category"] = cat
+        rows.append(stats)
+    return pd.DataFrame(rows).set_index("category")
+
+
+def by_period(trades: pd.DataFrame, period_freq: str = "M",
+              bankroll: float = BANKROLL) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame()
+    tr = trades.copy()
+    tr["period"] = pd.to_datetime(tr["exit_ts"]).dt.to_period(period_freq)
+    rows = []
+    for p, g in tr.groupby("period"):
+        stats = compute_risk_stats(g, bankroll=bankroll)
+        stats["period"] = str(p)
+        rows.append(stats)
+    return pd.DataFrame(rows).set_index("period")
+
+STRATEGIES = ["mom_vn", "mom_naive", "rev_vn", "rev_naive", "unconditional"]
+
+
+def run_full_grid(
+    df: pd.DataFrame,
+    strategies: Optional[List[str]] = None,
+    horizons: Optional[List[int]] = None,
+    entry_threshold: float = DEFAULT_ENTRY_THRESHOLD,
+    entry_frac: float = DEFAULT_ENTRY_FRAC,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Runs the full strategy x horizon grid. Returns dict with:
+      trades:    concatenated per-trade log with strategy & horizon
+      overall:   one row per (strategy, horizon) with the full risk suite
+      by_cat:    long-form (strategy, horizon, category) risk suite
+      by_period: long-form (strategy, horizon, period) risk suite
+    """
+    strategies = strategies or STRATEGIES
+    horizons = horizons or DEFAULT_HOLDING_HOURS
+
+    all_trades: List[pd.DataFrame] = []
+    overall_rows: List[Dict] = []
+    cat_rows: List[Dict] = []
+    per_rows: List[Dict] = []
+    naive_thresholds = {}
+    for strat in ("mom_naive", "rev_naive"):
+        if strat in df.columns:
+            abs_signal = df[strat].abs().dropna()
+            if len(abs_signal) > 100:
+                naive_thresholds[strat] = float(abs_signal.quantile(0.93))
+            else:
+                naive_thresholds[strat] = entry_threshold  # fallback
+
+    for strat in strategies:
+        for H in horizons:
+            if strat == "unconditional":
+                th = 0.0
+            elif strat in naive_thresholds:
+                th = naive_thresholds[strat]
+            else:
+                th = entry_threshold  # vol-normalized default
+            trades = generate_trades(df, signal_col=strat, horizon_hours=H,
+                                     entry_threshold=th, entry_frac=entry_frac)
+            if trades.empty:
+                continue
+            trades["strategy"] = strat
+            all_trades.append(trades)
+
+            stats = compute_risk_stats(trades)
+            stats["strategy"] = strat
+            stats["horizon_hours"] = H
+            overall_rows.append(stats)
+
+            cat_df = by_category(trades)
+            for cat, row in cat_df.iterrows():
+                r = row.to_dict(); r["strategy"] = strat
+                r["horizon_hours"] = H; r["category"] = cat
+                cat_rows.append(r)
+
+            per_df = by_period(trades)
+            for per, row in per_df.iterrows():
+                r = row.to_dict(); r["strategy"] = strat
+                r["horizon_hours"] = H; r["period"] = per
+                per_rows.append(r)
+
+    trades_out = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    overall = pd.DataFrame(overall_rows)
+    if not overall.empty:
+        overall = overall.set_index(["strategy", "horizon_hours"]).sort_index()
+
+    return {
+        "trades": trades_out,
+        "overall": overall,
+        "by_cat": pd.DataFrame(cat_rows),
+        "by_period": pd.DataFrame(per_rows),
     }

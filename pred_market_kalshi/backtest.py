@@ -16,11 +16,21 @@ DEFAULT_ENTRY_THRESHOLD = 1.5   # |z| for vol-normalized signals to fire
 DEFAULT_ENTRY_FRAC = 0.01       # 1% of bankroll per trade
 
 def _shift_signal_causally(df: pd.DataFrame, signal_col: str) -> pd.Series:
+    """
+    Explicit one-bar shift before checking for a fire, so the signal is
+    guaranteed built from info STRICTLY BEFORE the entry bar. Redundant
+    if the signal was already built causally, but cheap and explicit.
+    """
     return df.groupby("market_id")[signal_col].shift(1)
 
 
 def _future_price(df: pd.DataFrame, horizon: int) -> pd.Series:
     return df.groupby("market_id")["price"].shift(-horizon)
+
+
+def _future_spread(df: pd.DataFrame, horizon: int) -> pd.Series:
+    """Spread at the exit bar, same shift convention as _future_price."""
+    return df.groupby("market_id")["spread"].shift(-horizon)
 
 
 def _sign_by_signal(signal_col: str) -> int:
@@ -46,10 +56,14 @@ def generate_trades(
     min_volume: float = MIN_VOLUME_USD,
     min_days_to_resolution: float = MIN_DAYS_TO_RESOLUTION,
     bankroll: float = BANKROLL,
+    apply_slippage: bool = True,
 ) -> pd.DataFrame:
     df = df.sort_values(["market_id", "timestamp"]).reset_index(drop=True).copy()
     df["_signal"] = _shift_signal_causally(df, signal_col) if signal_col != "unconditional" else 1.0
     df["_exit_price"] = _future_price(df, horizon_hours)
+    has_spread_col = "spread" in df.columns
+    if apply_slippage and has_spread_col:
+        df["_exit_spread"] = _future_spread(df, horizon_hours)
 
     horizon_days = horizon_hours / 24.0
     fires = (
@@ -87,7 +101,15 @@ def generate_trades(
         _fees(float(ep), float(xp), float(sh))
         for ep, xp, sh in zip(entry_p, exit_p, shares)
     ])
-    net_pnl = gross_pnl - fees
+
+    if apply_slippage and has_spread_col:
+        entry_spread = hits["spread"].astype(float).fillna(0.0).to_numpy()
+        exit_spread = hits["_exit_spread"].astype(float).fillna(0.0).to_numpy()
+        slippage = shares * 0.5 * (entry_spread + exit_spread)
+    else:
+        slippage = np.zeros(len(hits))
+
+    net_pnl = gross_pnl - fees - slippage
 
     return pd.DataFrame({
         "market_id": hits["market_id"].values,
@@ -103,9 +125,12 @@ def generate_trades(
         "shares": shares,
         "gross_pnl": gross_pnl,
         "fees": fees,
+        "slippage": slippage,
         "net_pnl": net_pnl,
         "return_frac": net_pnl / bankroll,
     })
+
+
 
 def compute_risk_stats(trades: pd.DataFrame, bankroll: float = BANKROLL) -> Dict[str, float]:
     if trades.empty:
@@ -114,7 +139,7 @@ def compute_risk_stats(trades: pd.DataFrame, bankroll: float = BANKROLL) -> Dict
             "win_rate": np.nan, "total_pnl": 0.0, "mean_return": np.nan,
             "daily_sharpe_annualized": np.nan, "daily_vol": np.nan,
             "max_drawdown": np.nan, "turnover_per_day": np.nan,
-            "total_fees": 0.0, "sharpe_reliable": False,
+            "total_fees": 0.0, "total_slippage": 0.0, "sharpe_reliable": False,
         }
 
     tr = trades.copy()
@@ -149,6 +174,7 @@ def compute_risk_stats(trades: pd.DataFrame, bankroll: float = BANKROLL) -> Dict
         "max_drawdown": max_dd,
         "turnover_per_day": turnover_per_day,
         "total_fees": float(tr["fees"].sum()),
+        "total_slippage": float(tr["slippage"].sum()) if "slippage" in tr.columns else 0.0,
         "sharpe_reliable": bool(n_days >= 5),
     }
 
@@ -186,14 +212,8 @@ def run_full_grid(
     horizons: Optional[List[int]] = None,
     entry_threshold: float = DEFAULT_ENTRY_THRESHOLD,
     entry_frac: float = DEFAULT_ENTRY_FRAC,
+    apply_slippage: bool = True,
 ) -> Dict[str, pd.DataFrame]:
-    """
-    Runs the full strategy x horizon grid. Returns dict with:
-      trades:    concatenated per-trade log with strategy & horizon
-      overall:   one row per (strategy, horizon) with the full risk suite
-      by_cat:    long-form (strategy, horizon, category) risk suite
-      by_period: long-form (strategy, horizon, period) risk suite
-    """
     strategies = strategies or STRATEGIES
     horizons = horizons or DEFAULT_HOLDING_HOURS
 
@@ -219,7 +239,8 @@ def run_full_grid(
             else:
                 th = entry_threshold  # vol-normalized default
             trades = generate_trades(df, signal_col=strat, horizon_hours=H,
-                                     entry_threshold=th, entry_frac=entry_frac)
+                                     entry_threshold=th, entry_frac=entry_frac,
+                                     apply_slippage=apply_slippage)
             if trades.empty:
                 continue
             trades["strategy"] = strat

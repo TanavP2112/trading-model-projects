@@ -1,20 +1,96 @@
-Kalshi Database Credits (June 2021 – January 2026): https://huggingface.co/datasets/TrevorJS/kalshi-trades
+# Structural Volatility Modeling & Vol-Normalized Signal Backtests on Kalshi
 
-Notes:
-The paper's specification assumes Gaussian innovations. On Kalshi hourly data we observe realized 1-hour moves with a p99/median ratio of ~24× (compared to ~3.3 under Gaussian), suggesting substantially fatter tails than the paper's specification handles. We therefore also fit the joint model under Student-t innovations with degrees-of-freedom ν estimated per model (fitted jointly for GARCH variants, method-of-moments from training residuals for DR and DR-AS). On the full 4.5-year Kalshi panel, this specification maintains coverage near the nominal 95% while sharpening intervals by ~32% for GARCH+DR-AS, yielding a further ~10-16% Winkler improvement beyond the Gaussian baseline. This is not a criticism of the original paper's specification but an adaptation to the microstructure of the target venue.
+---
 
-Following Xi et al. (2026), we implement the joint structural + GARCH specification with Gaussian innovations on Kalshi hourly data, reproducing their central claim that combining the structural DR-AS model with residual GARCH dynamics dominates plain ARCH/GARCH benchmarks (GARCH+DR-AS volume-weighted Winkler score = 1.132 vs 1.213 for the DR-only baseline). Given that Kalshi's realized 1-hour returns exhibit a p99/median ratio of approximately 24× — substantially fatter tails than a Gaussian innovation can accommodate — we additionally test a Student-t specification, fitting the degrees-of-freedom parameter ν jointly with the GARCH parameters (or empirically from training residuals for the DR/DR-AS variants where no MLE step exists). The Student-t specification reduces the joint model's Winkler score by an additional 27% (0.824 vs 1.132), maintains empirical coverage within 3% of the nominal 95%, and yields uniform wins across all five contract categories (versus the Gaussian specification's wins in only three of five). This suggests the paper's structural insight combines productively with a more realistic innovation distribution.
+## Repository Structure
 
-Statistics of the Dataset:
-n bars total: 4,381,176
-spread median: 0.0100
-spread mean: 0.0121
-spread p10 / p25 / p75 / p90: 0.0100 / 0.0100 / 0.0100 / 0.0141
-spread == 0.01 (floor): 3,463,597 (79.1%)
-spread > 0.05: 43,489 (1.0%)
-Correlation(spread, volume): -0.009
+```
+├── data_fetcher.py       # HF -> DuckDB -> hourly panel, with spread reconstruction
+├── volatility_model.py   # DR / DR-AS / GARCH / GARCH+DR-AS, Numba-JIT'd recursion + QMLE fit
+├── test1.py              # Phase 1 walk-forward runner (Winkler evaluation)
+├── signals.py            # Momentum & reversal signal construction (naive + vol-normalized)
+├── backtest.py           # Phase 2 fixed-horizon trade generation + risk suite
+├── run_demo.py           # Phase 2 walk-forward runner
+├── fees.py                # Kalshi taker fee schedule
+├── config.py              # Backtest constants (position sizing, filters)
+├── data/                  # Cached panel + walk-forward outputs (parquet/csv)
+└── prediction_market_pipeline.ipynb   # End-to-end reproducible notebook with charts
+```
 
-## References:
+---
 
-- Weiye Xi, Ciamac C. Moallemi, Mallesh Pai, Shouqiao Wang (2026). Volatility in Prediction Markets: A Structural Approach.
-  arXiv, 2607.08199, q-fin.TR, https://arxiv.org/abs/2607.08199
+## Data
+
+The data was constructed from `TrevorJS/kalshi-trades` (HuggingFace), Kalshi's public trade-level feed, aggregated to hourly bars via DuckDB. The dataset contains **4.4M hourly bars across 26,258 markets, from August 2021 – 2026**, spanning 5 main contract categories (Sports, Economics, Crypto, Entertainment, Politics).
+
+---
+
+## Summary of Results
+
+**Phase 1 — Volatility forecasting.** The paper's joint structural + GARCH specification (`GARCH+DR-AS`) reproduces cleanly: it achieves the lowest volume-weighted Winkler interval score of any model tested, reducing Winkler by **28.8% vs. a plain GARCH(1,1) baseline** and winning **4 of 5 contract categories**, with empirical coverage of ~99% (nominal 95%). Evaluated on 1.73M active out-of-sample contract-hours — roughly double the paper's reported 880k.
+
+**Phase 2 — Trading signal tests.** Vol-normalized momentum shows Sharpe ratios of −8.9 to −3.9 across four fixed holding periods (1/6/12/24h) on ~43k out-of-sample trades. Vol-normalized reversal shows an apparent positive Sharpe that a pooled-vs-fold-averaged diagnostic traces to single-event concentration (an early version of the panel showed a pooled Sharpe of +15 at H=6h driven almost entirely by November 2024 election contracts; after tightening the panel to match the paper's filtering conventions, the same signal's Sharpe collapsed to +2.4). ~349k out-of-sample trades total across four strategies and four horizons.
+
+---
+
+## Methodology
+
+### Phase 1: Volatility model
+
+Four nested specifications, following the paper's structural decomposition:
+
+| Model         | Description                                                                                           |
+| ------------- | ----------------------------------------------------------------------------------------------------- |
+| `DR`          | Deadline-resolution baseline: `h² = p(1-p)/τ · Δ` (Wright-Fisher). No fitted parameters.              |
+| `DR-AS`       | DR + Glosten-Milgrom adverse-selection term: `h² = DR + K·ν(V)·s²/4`. Fits scalar `K` via OLS.        |
+| `GARCH`       | Plain GARCH(1,1), no structural terms. Isolates whether structure adds value over generic clustering. |
+| `GARCH+DR-AS` | Full joint specification: structural terms + GARCH residual dynamics, fit jointly via QMLE.           |
+
+**Estimation.** All models fit via **Gaussian quasi-maximum likelihood (QMLE)**, matching the original paper (Appendix B, eq. 17) and Bollerslev & Wooldridge (1992), which is also used in the volatility paper.
+
+**Interval construction.** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar |Δp| has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
+
+**Evaluation.** Monthly expanding walk-forward. Following the paper's Appendix B/C "Analysis filtering" convention, retain contracts with ≥48 hourly observations and filter to active bars (`|ε| > 1e-10`) at evaluation time.
+
+### Phase 2: Trading signals
+
+Two signals were used: Momentum and Reversal
+
+- `mom_naive` / `mom_vn`: `p_t − p_{t−5}` (5-bar lookback)
+- `rev_naive` / `rev_vn`: `p_t − rollmean(p, 24)` (24-bar lookback)
+
+Fixed holding periods (1/6/12/24h), entry threshold at around the 93rd percentile of each signal's own magnitude distribution (equivalent to ~|z|=1.5 for vol-normalized signals), Kalshi taker fees (3.5% each side) — as well as slippage costs — deducted from every trade. A pooled-vs-fold-averaged Sharpe diagnostic is used to detect event-concentration: a large gap between the two indicates the pooled result is driven by a small number of periods rather than persistent edge.
+
+---
+
+## Known Limitations
+
+**Spread reconstruction is weak, and no third-party order-book provider can backfill the full panel:** The public trade feed has no order-book/quote data, so the paper's adverse-selection channel (which depends on time-varying quoted spreads) can't be identified directly. An _effective_ spread is reconstructed from trade aggressor flow (`taker_side`: `min(price | taker=yes) − max(price | taker=no)` per contract-hour, with rolling-median fallback and EWMA smoothing), but ~79% of bars fall through to the minimum-tick floor due to one-sided hourly flow, and the reconstructed spread shows negligible correlation with volume (−0.009, vs. the negative correlation microstructure theory predicts). As a result, `DR-AS` and plain `GARCH` perform almost identically in this reproduction — the AS channel is not sharply identified.
+
+I surveyed five third-party Kalshi order-book providers (Allium, Lychee Data, Dome API, Oddpool, Predexon) as a possible source of real quoted spreads. **None of these API's can substitute for the missing data across this panel's 4.5-year span.** Kalshi's public API has never exposed historical order-book snapshots, so every provider's archive only covers the window they personally started polling in real time — there is no backfill:
+
+| Provider    | Order-book coverage starts                                                                                                                                                                                                                                                                        | Access                               |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| Dome API    | Oct 29, 2025 (~9 months of panel)                                                                                                                                                                                                                                                                 | Free REST API (Limited Data However) |
+| Predexon    | Jan 7, 2026 (~6 months of panel)                                                                                                                                                                                                                                                                  | Free REST API (Limited Data However) |
+| Oddpool     | Undated ("since we started subscribing")                                                                                                                                                                                                                                                          | Enterprise only                      |
+| Allium      | Undated, SQL warehouse                                                                                                                                                                                                                                                                            | Enterprise only                      |
+| Lychee Data | Marketed as "since July 2021," but every order-book-specific claim is hedged ("where available") while trade/market claims aren't — the coverage is almost certainly recent-only despite the framing. Also has no API (browser/CSV export only), so it can't feed a scripted pipeline regardless. | Paid, no-code only                   |
+
+A lot of the most complete API's (or databases) are locked behind expensive enterprise-level paywalls that do not make sense for the scope of this project. As such, using the huggingface data was the most appropriate option here.
+
+**Follow-up on API's Explored:** Dome's and Predexon's free tiers do overlap the most recent few months of this panel (Specifically around the end of 2025). A natural next step is pulling real quoted spreads for that overlapping window and directly measuring the correlation with our aggressor-reconstructed spread — turning the current indirect proxies (floor rate, volume correlation) into a quantified validation against ground truth. This wouldn't extend AS identification to the full panel, but it would tell us how much to trust the reconstruction where it's used. Again, **This is not a substitute for the analysis already performed, and the essence of the conclusion still remains consistent regardless**.
+
+**Some niche markets merged with the major markets for the sake of generality:** While Kalshi does contain more niche and less liquid markets, the names of the categories are either very similar or on topic with the main 5 categories. As such, for the sake of generality in our analysis we have merged specific categories together (Elections markets now coincide with the Politics markets). This does not dilute the conclusions of what the paper has produced, and remains consistent with its findings.
+
+**Gap-unaware Time Windowing:** The paper's panel is gap-free because Kalshi's continuously-quoted order book gives a mid-quote every hour regardless of trading activity; ours is trade-only, so hours with zero trades have no observation at all. We flag gap-preceded rows (`is_clean_bar`) and exclude them from final Phase-1 evaluation, but this filter is not yet propagated into the GARCH/DR-AS parameter fits, the empirical-quantile interval construction, or Phase 2's signal-construction windows and fixed-horizon exit lookups — these currently assume adjacent panel rows are exactly one hour apart, which is true for roughly 53% of consecutive row-pairs. This is a data-access limitation (no public quote data) compounded by an incomplete fix, and is the top item for a follow-up iteration.
+
+**Last-trade Prices, Not Mid-quotes:** The paper primarily uses close-of-hour mid-quotes; I use last-trade prices from necessity. The paper's own Appendix E confirms the model ranking is preserved under this variant, so this reproduction aligns with that robustness check rather than the primary specification.
+
+**DR Baseline is Pathological in Sports and Economics:** The deadline-resolution variance formula produces very large h² for some near-boundary, short-τ contracts in these categories (Winkler 4.88 and 2.22 respectively), inflating empirical interval widths. This doesn't affect the DR-AS/GARCH/GARCH+DR-AS comparisons, which are the ones that matter f the paper's central claim, but it means DR-relative improvement percentages should be read cautiously.
+
+---
+
+## References
+
+Xi, W., Moallemi, C. C., Pai, M., & Wang, S. (2026). _Volatility in Prediction Markets: A Structural Approach_. arXiv:2607.08199.
