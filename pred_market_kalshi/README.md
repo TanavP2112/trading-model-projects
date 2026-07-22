@@ -21,7 +21,7 @@
 
 ## Data
 
-The data was constructed from `TrevorJS/kalshi-trades` (HuggingFace), Kalshi's public trade-level feed, aggregated to hourly bars via DuckDB. The dataset contains **4.4M hourly bars across 26,258 markets, from August 2021 – 2026**, spanning 5 main contract categories (Sports, Economics, Crypto, Entertainment, Politics).
+The data was constructed from `TrevorJS/kalshi-trades` (HuggingFace), Kalshi's public trade-level feed, aggregated to hourly bars via DuckDB. The dataset contains **4.4M hourly bars across 26,258 markets, from August 2021 – January 2026**, spanning 5 main contract categories (Sports, Economics, Crypto, Entertainment, Politics).
 
 ---
 
