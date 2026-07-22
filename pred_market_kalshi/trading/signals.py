@@ -12,14 +12,6 @@ from volatility_model import (
 DEFAULT_MOM_LOOKBACK = 5   # bars (~5 hours on the hourly panel)
 DEFAULT_REV_LOOKBACK = 24  # bars (~1 day)
 
-
-# Category -> winning Phase-1 model, based on real Winkler results.
-# GARCH+DR-AS wins Crypto/Sports/Economics; DR-AS wins Politics/Entertainment
-# (which are also the smallest samples -- the effect is real on the numbers
-# but may or may not generalize; using DR-AS there is at worst equivalent
-# to the second-best model, and it avoids the small-sample GARCH fit
-# instability that likely explains why plain GARCH beat GARCH+DR-AS in a
-# few thin Politics/Entertainment folds).
 PHASE1_WINNER_BY_CATEGORY: Dict[str, str] = {
     "Crypto": "GARCH+DR-AS",
     "Sports": "GARCH+DR-AS",
@@ -28,10 +20,6 @@ PHASE1_WINNER_BY_CATEGORY: Dict[str, str] = {
     "Entertainment": "DR-AS",
 }
 
-
-# ---------------------------------------------------------------------------
-# h^2 attach (Phase 1 winner)
-# ---------------------------------------------------------------------------
 def attach_h2(
     df: pd.DataFrame,
     train_mask: pd.Series,
