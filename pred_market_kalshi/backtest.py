@@ -154,7 +154,6 @@ def compute_risk_stats(trades: pd.DataFrame, bankroll: float = BANKROLL) -> Dict
 
 
 def by_category(trades: pd.DataFrame, bankroll: float = BANKROLL) -> pd.DataFrame:
-    """Point-6/7: performance by category."""
     if trades.empty or "category" not in trades.columns:
         return pd.DataFrame()
     rows = []
@@ -167,7 +166,6 @@ def by_category(trades: pd.DataFrame, bankroll: float = BANKROLL) -> pd.DataFram
 
 def by_period(trades: pd.DataFrame, period_freq: str = "M",
               bankroll: float = BANKROLL) -> pd.DataFrame:
-    """Point-6/7: performance by calendar period."""
     if trades.empty:
         return pd.DataFrame()
     tr = trades.copy()

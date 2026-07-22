@@ -39,25 +39,11 @@ def attach_h2(
     spread_col: str = "spread",
 ) -> pd.DataFrame:
     """
-    Fits the chosen volatility model on train_mask==True rows, then attaches
-    the frozen-parameter h^2 forecast to every row (train + test) as column
-    'h2'. Fit-only-on-train / freeze-before-test discipline mirrors what
-    test1.py already used for the Phase-1 Winkler comparison, so signals
-    built downstream inherit the leakage-safety.
-
-    `model` accepts either:
-      - a single string ("DR" / "DR-AS" / "GARCH" / "GARCH+DR-AS"), applied
-        to the whole panel; OR
-      - a dict {category -> model_name}, applied PER-CATEGORY. Use
-        PHASE1_WINNER_BY_CATEGORY (or your own) when the Phase-1 winner
-        varies across categories -- the reviewer's point-6 by-category
-        heterogeneity, honored directly rather than averaged away.
-
     model options -- pick whichever WON Phase 1's Winkler comparison:
         "DR"           -- deadline-resolution only (no fit needed)
         "DR-AS"        -- fits K on train via OLS
         "GARCH"        -- joint plain GARCH (c=0, K=0)
-        "GARCH+DR-AS"  -- full joint model (default; reviewer's expectation)
+        "GARCH+DR-AS"  -- full joint model
     """
     if isinstance(model, dict):
         return _attach_h2_by_category(df, train_mask, model_map=model, spread_col=spread_col)
@@ -142,11 +128,6 @@ def momentum_naive(df: pd.DataFrame, lookback: int = DEFAULT_MOM_LOOKBACK) -> pd
 def momentum_vol_normalized(df: pd.DataFrame, lookback: int = DEFAULT_MOM_LOOKBACK) -> pd.Series:
     """
     Vol-normalized momentum: (p_t - p_{t-lookback}) / sqrt(sum_{s=t-lookback+1..t} h_s^2).
-
-    The denominator is the model's OWN variance forecast for a lookback-length
-    return, so the signal reads as a z-score. Constant thresholds on this z-score
-    are meaningful across markets in a way that thresholds on raw price moves
-    aren't -- which is the whole point of the vol pivot the reviewer aligned to.
     """
     raw = momentum_naive(df, lookback)
     var_lb = (
@@ -193,12 +174,6 @@ def add_all_signals(
     spread_col: str = "spread",
 ) -> pd.DataFrame:
     """
-    One-call convenience: fits the vol model on train_mask, attaches h2/h,
-    then adds all four signal columns (naive + vol-normalized momentum &
-    reversal) so backtest.py can compare them directly. Naive versions are
-    the reviewer's point-7 benchmark ("naive momentum/reversal without
-    volatility normalization").
-
     Adds columns:
         h2, h  (from the Phase-1 winning model)
         mom_naive, mom_vn        (momentum, naive & vol-normalized)
@@ -212,22 +187,11 @@ def add_all_signals(
     return df
 
 
-# ---------------------------------------------------------------------------
-# Diagnostic: correlation & turnover between the two signals (reviewer point 4)
-# ---------------------------------------------------------------------------
 def signal_correlation_and_turnover(
     df: pd.DataFrame,
     mom_col: str = "mom_vn",
     rev_col: str = "rev_vn",
 ) -> Dict[str, float]:
-    """
-    The reviewer's point 4 asks to MEASURE the individual correlation and
-    turnover of the two signals BEFORE combining them -- correlated bets
-    on the same bankroll double-count risk.
-
-    Turnover here is defined as the mean absolute per-bar CHANGE in signal
-    per market (higher -> more re-positioning, more fees).
-    """
     valid = df[[mom_col, rev_col]].dropna()
     corr = float(valid[mom_col].corr(valid[rev_col])) if len(valid) > 10 else float("nan")
 
