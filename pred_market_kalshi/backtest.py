@@ -15,16 +15,7 @@ DEFAULT_HOLDING_HOURS = [1, 6, 12, 24]
 DEFAULT_ENTRY_THRESHOLD = 1.5   # |z| for vol-normalized signals to fire
 DEFAULT_ENTRY_FRAC = 0.01       # 1% of bankroll per trade
 
-
-# ---------------------------------------------------------------------------
-# Fixed-horizon trade generation
-# ---------------------------------------------------------------------------
 def _shift_signal_causally(df: pd.DataFrame, signal_col: str) -> pd.Series:
-    """
-    Explicit one-bar shift before checking for a fire, so the signal is
-    guaranteed built from info STRICTLY BEFORE the entry bar. Redundant
-    if the signal was already built causally, but cheap and explicit.
-    """
     return df.groupby("market_id")[signal_col].shift(1)
 
 
@@ -33,11 +24,6 @@ def _future_price(df: pd.DataFrame, horizon: int) -> pd.Series:
 
 
 def _sign_by_signal(signal_col: str) -> int:
-    """
-    Momentum: bet WITH the signal (positive z -> buy YES).
-    Reversal: bet AGAINST the signal (positive z means price is elevated
-              -> short YES = buy NO).
-    """
     if "mom" in signal_col:
         return +1
     if "rev" in signal_col:
@@ -121,10 +107,6 @@ def generate_trades(
         "return_frac": net_pnl / bankroll,
     })
 
-
-# ---------------------------------------------------------------------------
-# Risk stats -- reviewer's point-7 suite
-# ---------------------------------------------------------------------------
 def compute_risk_stats(trades: pd.DataFrame, bankroll: float = BANKROLL) -> Dict[str, float]:
     if trades.empty:
         return {
@@ -221,10 +203,23 @@ def run_full_grid(
     overall_rows: List[Dict] = []
     cat_rows: List[Dict] = []
     per_rows: List[Dict] = []
+    naive_thresholds = {}
+    for strat in ("mom_naive", "rev_naive"):
+        if strat in df.columns:
+            abs_signal = df[strat].abs().dropna()
+            if len(abs_signal) > 100:
+                naive_thresholds[strat] = float(abs_signal.quantile(0.93))
+            else:
+                naive_thresholds[strat] = entry_threshold  # fallback
 
     for strat in strategies:
         for H in horizons:
-            th = 0.0 if strat == "unconditional" else entry_threshold
+            if strat == "unconditional":
+                th = 0.0
+            elif strat in naive_thresholds:
+                th = naive_thresholds[strat]
+            else:
+                th = entry_threshold  # vol-normalized default
             trades = generate_trades(df, signal_col=strat, horizon_hours=H,
                                      entry_threshold=th, entry_frac=entry_frac)
             if trades.empty:
