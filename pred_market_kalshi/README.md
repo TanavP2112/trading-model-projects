@@ -50,7 +50,7 @@ Four nested specifications, following the paper's structural decomposition:
 
 **Interval construction.** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar |Δp| has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
 
-**Evaluation.** Monthly expanding walk-forward. Following the paper's Appendix B/C "Analysis filtering" convention, retain contracts with ≥48 hourly observations and filter to active bars (`|ε| > 1e-10`) at evaluation time.
+**Evaluation.** Monthly expanding walk-forward. Following the paper's "Analysis filtering" convention, retain contracts with ≥48 hourly observations and filter to active bars (`|ε| > 1e-10`) at evaluation time.
 
 ### Phase 2: Trading signals
 
