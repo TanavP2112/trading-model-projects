@@ -34,9 +34,6 @@ def predict_h2_all_models(
         .sort_values(["market_id", "timestamp"])
         .reset_index(drop=True)
     )
-    
-    # Track original test indices within full_df
-    # Fast boolean indexing instead of list comprehension over tuples
     full_df["_id_ts"] = full_df["market_id"].astype(str) + "_" + full_df["timestamp"].astype(str)
     test_set = set(test_df["market_id"].astype(str) + "_" + test_df["timestamp"].astype(str))
     test_mask = full_df["_id_ts"].isin(test_set).to_numpy()
@@ -165,7 +162,7 @@ def evaluate_walk_forward(
     """
     df = df.copy()
     
-    # 1. Parse timestamps safely (handling Unix epoch seconds vs ms vs string datetimes)
+    # 1. Parse timestamps safely
     if pd.api.types.is_numeric_dtype(df["timestamp"]):
         unit = "ms" if df["timestamp"].iloc[0] > 1e11 else "s"
         df["datetime"] = pd.to_datetime(df["timestamp"], unit=unit, errors="coerce")
@@ -176,7 +173,7 @@ def evaluate_walk_forward(
     df = df.dropna(subset=["datetime"]).sort_values(["market_id", "datetime"]).reset_index(drop=True)
 
     # 2. Pre-calculate 1-bar price changes (actual_dp) vector-wide to avoid loop overhead
-    df["actual_dp"] = df.groupby("market_id")["price"].diff().fillna(0.0)
+    df["actual_dp"] = df.groupby("market_id")["price"].diff().shift(-1).fillna(0.0)
 
     # 3. Try Monthly splits first; fall back to Weekly if span is short
     df["period"] = df["datetime"].dt.to_period("M")

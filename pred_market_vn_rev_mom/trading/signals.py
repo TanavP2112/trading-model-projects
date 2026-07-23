@@ -6,33 +6,68 @@ from volatility_model import (
     structural_h2, fit_K, fit_garch_dr_as_joint, garch_dr_as_h2,
     DEFAULT_BAR_LENGTH,
 )
+DEFAULT_MOM_LOOKBACK = 5   # (5 hours on the hourly panel)
+DEFAULT_REV_LOOKBACK = 24  # (1 day on the hourly panel)
 
-# Default lookbacks -- one modest, one longer, matching the paper's
-# convention of momentum being a shorter effect than mean-reversion.
-DEFAULT_MOM_LOOKBACK = 5   # bars (~5 hours on the hourly panel)
-DEFAULT_REV_LOOKBACK = 24  # bars (~1 day)
-
-PHASE1_WINNER_BY_CATEGORY: Dict[str, str] = {
+# The `_BOOTSTRAP_WINNERS` map below is used ONLY when no saved Phase 1
+# output exists, this is from MY CURRENT AND MOST RECENT RUN. if this is
+# fallen back to, something is wrong with the code
+_BOOTSTRAP_WINNERS: Dict[str, str] = {
     "Crypto": "GARCH+DR-AS",
     "Sports": "GARCH+DR-AS",
     "Economics": "GARCH+DR-AS",
-    "Politics": "DR-AS",
-    "Entertainment": "DR-AS",
+    "Politics": "GARCH+DR-AS",
+    "Entertainment": "GARCH+DR-AS",
 }
 
+
+def get_phase1_winners(
+    by_category_csv_path: str = "data/walk_forward/wf_by_category.csv",
+    score_col: str = "Volume-Weighted Winkler Score",
+    verbose: bool = True,
+) -> Dict[str, str]:
+    import os
+    if not os.path.exists(by_category_csv_path):
+        if verbose:
+            print(f"[signals] Phase 1 output not found at {by_category_csv_path}; "
+                  f"using bootstrap fallback (rerun Phase 1 for authoritative winners).")
+        return dict(_BOOTSTRAP_WINNERS)
+
+    df = pd.read_csv(by_category_csv_path)
+    if "category" not in df.columns:
+        # Saved with (category, model) as index; reload with index_col
+        df = pd.read_csv(by_category_csv_path, index_col=[0, 1]).reset_index()
+    winners = (
+        df.loc[df.groupby("category")[score_col].idxmin()]
+          .set_index("category")["model"]
+          .to_dict()
+    )
+    if verbose:
+        print(f"[signals] Loaded Phase 1 winners from {by_category_csv_path}: {winners}")
+    return winners
+PHASE1_WINNER_BY_CATEGORY: Dict[str, str] = _BOOTSTRAP_WINNERS
+
+
+def load_phase1_winners_from_csv(*args, **kwargs) -> Dict[str, str]:
+    """Deprecated alias for get_phase1_winners(). Kept for backwards compat."""
+    return get_phase1_winners(*args, **kwargs)
 def attach_h2(
     df: pd.DataFrame,
     train_mask: pd.Series,
-    model: str | Dict[str, str] = "GARCH+DR-AS",
+    model: str | Dict[str, str] | None = None,
     spread_col: str = "spread",
 ) -> pd.DataFrame:
     """
-    model options -- pick whichever WON Phase 1's Winkler comparison:
+    model options:
         "DR"           -- deadline-resolution only (no fit needed)
         "DR-AS"        -- fits K on train via OLS
         "GARCH"        -- joint plain GARCH (c=0, K=0)
         "GARCH+DR-AS"  -- full joint model
     """
+    # Resolve default: dynamically load Phase 1 winners
+    if model is None:
+        model = get_phase1_winners()
+
     if isinstance(model, dict):
         return _attach_h2_by_category(df, train_mask, model_map=model, spread_col=spread_col)
 
@@ -101,10 +136,6 @@ def _attach_h2_by_category(
 
     return pd.concat(frames).sort_values(["market_id", "timestamp"]).reset_index(drop=True)
 
-
-# ---------------------------------------------------------------------------
-# ONE momentum rule, ONE reversal rule
-# ---------------------------------------------------------------------------
 def momentum_naive(df: pd.DataFrame, lookback: int = DEFAULT_MOM_LOOKBACK) -> pd.Series:
     """
     Raw momentum: p_t - p_{t-lookback}, per market. Positive -> recent up-move.
@@ -149,31 +180,20 @@ def reversal_vol_normalized(df: pd.DataFrame, lookback: int = DEFAULT_REV_LOOKBA
     )
     return raw / np.sqrt(np.clip(var_lb.values, 1e-12, None))
 
-
-# ---------------------------------------------------------------------------
-# One-call attach
-# ---------------------------------------------------------------------------
 def add_all_signals(
     df: pd.DataFrame,
     train_mask: pd.Series,
-    model: str | Dict[str, str] = "GARCH+DR-AS",
+    model: str | Dict[str, str] | None = None,
     mom_lookback: int = DEFAULT_MOM_LOOKBACK,
     rev_lookback: int = DEFAULT_REV_LOOKBACK,
     spread_col: str = "spread",
 ) -> pd.DataFrame:
-    """
-    Adds columns:
-        h2, h  (from the Phase-1 winning model)
-        mom_naive, mom_vn        (momentum, naive & vol-normalized)
-        rev_naive, rev_vn        (reversal, naive & vol-normalized)
-    """
     df = attach_h2(df, train_mask=train_mask, model=model, spread_col=spread_col)
     df["mom_naive"] = momentum_naive(df, mom_lookback).values
     df["mom_vn"] = momentum_vol_normalized(df, mom_lookback).values
     df["rev_naive"] = reversal_naive(df, rev_lookback).values
     df["rev_vn"] = reversal_vol_normalized(df, rev_lookback).values
     return df
-
 
 def signal_correlation_and_turnover(
     df: pd.DataFrame,
