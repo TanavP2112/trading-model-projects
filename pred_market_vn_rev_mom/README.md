@@ -27,12 +27,6 @@ When prediction markets started to become more and more popular, as the retail m
 
 ---
 
-## The Basics + The Logic
-
-(math and a basic explanation will be added here soon :D)
-
----
-
 ## Data
 
 The data was constructed from `TrevorJS/kalshi-trades` (HuggingFace), Kalshi's public trade-level feed, aggregated to hourly bars via DuckDB. The dataset contains **4.4M hourly bars across 26,258 markets, from August 2021 – January 2026**, spanning 5 main contract categories (Sports, Economics, Crypto, Entertainment, Politics).
@@ -61,6 +55,8 @@ Four nested specifications, following the paper's structural decomposition:
 | `GARCH+DR-AS` | Full joint specification: structural terms + GARCH residual dynamics, fit jointly via QMLE.           |
 
 **Estimation:** All models fit via **Gaussian quasi-maximum likelihood (QMLE)**, matching the original paper (Appendix B, eq. 17) and Bollerslev & Wooldridge (1992), which is also used in the volatility paper.
+
+$$\widehat{\theta}_m \in \arg\min_{\theta} \sum\_{i \in \mathcal{T}\_m^{\text{train}}} V_i \left\{ \log h_i^2(\theta) + \frac{\varepsilon_i^2}{h_i^2(\theta)} \right\}$$
 
 **Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar |Δp| has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
 
