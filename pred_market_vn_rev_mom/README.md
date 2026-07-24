@@ -19,6 +19,20 @@
 
 ---
 
+## Motivation
+
+I have always been fascinated by how the stock market, options, and various financial instruments work. I watched countless Youtube videos on strategies (both good and VERY BAD) and the logic/structures behind why and why they don't work. A strategy that has always stuck out to me was the class of volatility strategies. When it comes to the stock market, volatility is an essential tool for options traders. More specifically, a strategy that has always caught my eye was the usage of volatility forecasting models to take advantage of mispricings between implied volatility and market-implied volatility.
+
+When prediction markets started to become more and more popular, as the retail market grew, so did my curiousity. I wanted to use this opportunity to not only research about how prediction markets work, but also if it was even possible to employ similar mispricing strategies using volatility forecasting models. This led me to the paper that is the crux of this strategy: _Volatility in Prediction Markets: A Structural Approach_
+
+---
+
+## The Basics + The Logic
+
+(math and a basic explanation will be added here soon :D)
+
+---
+
 ## Data
 
 The data was constructed from `TrevorJS/kalshi-trades` (HuggingFace), Kalshi's public trade-level feed, aggregated to hourly bars via DuckDB. The dataset contains **4.4M hourly bars across 26,258 markets, from August 2021 – January 2026**, spanning 5 main contract categories (Sports, Economics, Crypto, Entertainment, Politics).
@@ -83,9 +97,11 @@ A lot of the most complete API's (or databases) are locked behind expensive ente
 
 **Some niche markets merged with the major markets for the sake of generality:** While Kalshi does contain more niche and less liquid markets, the names of the categories are either very similar or on topic with the main 5 categories. As such, for the sake of generality in our analysis we have merged specific categories together (Elections markets now coincide with the Politics markets). This does not dilute the conclusions of what the paper has produced, and remains consistent with its findings.
 
-**Limitations of Forward-Filling:** The paper's panel is gap-free because Kalshi's continuously-quoted order book gives a mid-quote every hour regardless of trading activity; ours is trade-only, so hours with zero trades have no observation at all. We flag gap-preceded rows (`is_clean_bar`) -- about 53% of consecutive observations are truly one hour apart. In order to combat this, a reindex was performed via forward-filling. This allows us to construct a proper hourly panel. However, this can be complicated when it comes to Sports specifcally, as according to Kalshi themselves, Sports markets officially opened in 2025.
+**Limitations of Forward-Filling:** The paper's panel is gap-free because Kalshi's continuously-quoted order book gives a mid-quote every hour regardless of trading activity; ours is trade-only, so hours with zero trades have no observation at all. We flag gap-preceded rows (`is_clean_bar`) -- about 53% of consecutive observations are truly one hour apart. In order to combat the gaps, a reindex was performed via forward-filling. This allows us to construct a proper hourly panel. However, this can be complicated when it comes to Sports specifcally, as according to Kalshi themselves, Sports markets officially opened in 2025.
 
-**Last-trade Prices, Not Mid-quotes:** The paper primarily uses close-of-hour mid-quotes; I use last-trade prices from necessity. The paper's own Appendix E confirms the model ranking is preserved under this variant, so this reproduction aligns with that robustness check rather than the primary specification.
+This means on markets such as sports, and markets that trade sporadically (think crypto or politics), those long lookback signals degrades in quality.
+
+**Last-trade Prices, Not Mid-quotes:** The paper primarily uses close-of-hour mid-quotes; I use last-trade prices from necessity. The paper's own Appendix E confirms the model ranking is preserved under this variant, so this reproduction aligns with that robustness check rather than the primary specification. Also, in order to not degrade and contaminate the quality of Phase 1 results, the active filter is applied as explained above and only active bars are used in the parameter estimations, maintaining consistency with the paper's methodology
 
 **DR Baseline is Pathological in Sports and Economics:** The deadline-resolution variance formula produces very large h² for some near-boundary, short-τ contracts in these categories (Winkler 4.88 and 2.22 respectively), inflating empirical interval widths. This doesn't affect the DR-AS/GARCH/GARCH+DR-AS comparisons, which are the ones that matter f the paper's central claim, but it means DR-relative improvement percentages should be read cautiously.
 
