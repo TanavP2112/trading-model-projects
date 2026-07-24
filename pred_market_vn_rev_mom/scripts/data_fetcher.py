@@ -81,27 +81,12 @@ def build_panel_from_hf_dataset(
             SELECT
                 market_id,
                 time_bucket(INTERVAL '1 hour', timestamp) AS timestamp,
-                -- Volume-weighted price. NULL if the hour had no volume,
-                -- which would only happen if trades were logged with count=0;
-                -- these rows are dropped downstream by the >= min_hourly_bars
-                -- market filter and the active-bar filter in test1.py.
                 SUM(price * volume) / NULLIF(SUM(volume), 0) AS price,
-                SUM(volume)                                    AS volume,
-                -- Aggressor-based spread bounds:
-                --   taker='yes' means the taker BOUGHT YES (hit the ask), so
-                --     the price is an upper bound on the mid + s/2. Min over
-                --     these prices is the cheapest ask touch during the hour.
-                --   taker='no' means the taker SOLD YES (hit the bid), so
-                --     the price is a lower bound on mid - s/2. Max over these
-                --     prices is the highest bid touch during the hour.
+                SUM(volume) AS volume,
                 MIN(CASE WHEN taker_side = 'yes' THEN price END) AS min_ask_touch,
                 MAX(CASE WHEN taker_side = 'no'  THEN price END) AS max_bid_touch,
                 COUNT(CASE WHEN taker_side = 'yes' THEN 1 END)   AS n_yes,
                 COUNT(CASE WHEN taker_side = 'no'  THEN 1 END)   AS n_no,
-                -- Volume (contract count), not trade count, split by taker
-                -- side. This is the raw material for order-flow imbalance
-                -- (order_flow_signal.py) -- distinct from n_yes/n_no above,
-                -- which only count trades and feed the spread reconstruction.
                 COALESCE(SUM(CASE WHEN taker_side = 'yes' THEN volume END), 0) AS yes_volume,
                 COALESCE(SUM(CASE WHEN taker_side = 'no'  THEN volume END), 0) AS no_volume
             FROM raw_trades
@@ -114,10 +99,6 @@ def build_panel_from_hf_dataset(
             volume,
             yes_volume,
             no_volume,
-            -- Raw reconstructed spread: NULL when either aggressor side has
-            -- fewer than 2 trades, or when the difference is non-positive
-            -- (within-hour price movement can flip the sign). These NULLs
-            -- are filled downstream by a per-market rolling median.
             CASE
                 WHEN n_yes >= 2 AND n_no >= 2
                      AND (min_ask_touch - max_bid_touch) > 0
@@ -144,10 +125,6 @@ def build_panel_from_hf_dataset(
                 time_bucket(INTERVAL '1 hour', timestamp) AS timestamp,
                 LAST(price) AS price,
                 SUM(volume) AS volume,
-                -- Kept even in this simpler path -- order-flow imbalance
-                -- (order_flow_signal.py) needs these regardless of whether
-                -- spread reconstruction is enabled; they're independent uses
-                -- of the same taker_side field.
                 COALESCE(SUM(CASE WHEN taker_side = 'yes' THEN volume END), 0) AS yes_volume,
                 COALESCE(SUM(CASE WHEN taker_side = 'no'  THEN volume END), 0) AS no_volume
             FROM raw_trades
@@ -159,36 +136,15 @@ def build_panel_from_hf_dataset(
     df_hourly = duckdb.query(query).df()
     print(f"[Info] Aggregated into {len(df_hourly):,} hourly bars! Cleaning panel...")
 
-    # 2. Sort by market_id and timestamp
+    # Sort by market_id and timestamp
     df_hourly["timestamp"] = pd.to_datetime(df_hourly["timestamp"], utc=True)
     df_hourly.sort_values(["market_id", "timestamp"], inplace=True)
     df_hourly.reset_index(drop=True, inplace=True)
-
-    # 3. Gap-aware bar validity. The paper's fitting criterion (Xi et al.
-    # 2026, eq. 17) sums Gaussian QMLE contributions over active contract-
-    # hours where eps_i = p_{i+1} - p_i is a genuine ONE-HOUR innovation.
-    # When a market has quiet hours with no trades, our panel skips those
-    # hours entirely -- but that means consecutive rows in the panel can
-    # span multi-hour gaps, in which case diff() produces a multi-hour
-    # cumulative move that shouldn't be treated as a one-hour innovation.
-    #
-    # We compute the actual time delta between consecutive rows per market
-    # and mark rows where the PRECEDING gap exceeds a threshold as
-    # gap-preceded. These rows should be excluded from likelihood
-    # contributions and from Winkler evaluation, since their eps is not
-    # a valid 1-hour price change.
-    #
-    # gap_hours = None on the first row of each market (no preceding delta),
-    # which downstream code should also treat as invalid for fitting.
     df_hourly["gap_hours"] = (
         df_hourly.groupby("market_id")["timestamp"]
                  .diff()
                  .dt.total_seconds() / 3600.0
     )
-    # A row is a "clean" one-hour innovation if the preceding gap was
-    # approximately 1 hour (allow a small tolerance for daylight savings
-    # and DuckDB time_bucket edge cases). is_clean_bar is True for bars
-    # that are safe to include in Winkler / likelihood as a 1-hour move.
     df_hourly["is_clean_bar"] = (
         df_hourly["gap_hours"].between(0.9, 1.1)
     )
@@ -201,7 +157,7 @@ def build_panel_from_hf_dataset(
     # Fill volume NaN with 0 (shouldn't happen after GROUP BY, but safe)
     df_hourly["volume"] = df_hourly["volume"].fillna(0.0)
 
-    # 3. Spread: reconstructed or placeholder
+    # Spread: reconstructed or placeholder
     if reconstruct_spread:
         print("[Info] Filling spread NULLs with per-market rolling 24h medians...")
         df_hourly["spread_rolling"] = (
