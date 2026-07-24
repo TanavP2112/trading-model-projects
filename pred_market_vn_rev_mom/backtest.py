@@ -15,10 +15,6 @@ DEFAULT_HOLDING_HOURS = [1, 6, 12, 24]
 DEFAULT_ENTRY_THRESHOLD = 1.5   # |z| for vol-normalized signals to fire
 DEFAULT_ENTRY_FRAC = 0.01       # 1% of bankroll per trade
 
-
-# ---------------------------------------------------------------------------
-# Fixed-horizon trade generation
-# ---------------------------------------------------------------------------
 def _shift_signal_causally(df: pd.DataFrame, signal_col: str) -> pd.Series:
     """
     Explicit one-bar shift before checking for a fire, so the signal is
@@ -68,28 +64,6 @@ def generate_trades(
     apply_slippage: bool = True,
     test_mask: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
-    """
-    apply_slippage : bool
-        If True (default), charge half the (reconstructed) bid-ask spread
-        on both entry and exit legs, in addition to Kalshi's stated taker
-        fee. This approximates the cost of crossing the spread as a taker
-        rather than transacting at the panel's volume-weighted mid price.
-
-        Caveat: the `spread` column is itself a reconstruction from trade
-        aggressor flow (see data_fetcher.py), not a directly observed
-        quoted spread -- ~79% of bars fall through to the 0.01 minimum-tick
-        floor (see README limitations). This makes the slippage estimate
-        a conservative, directionally-correct nudge rather than a precise
-        execution-cost model: it will never make a strategy's P&L look
-        better, only equal or worse, which is the safe direction to err
-        for an out-of-sample backtest.
-
-        If a bar's spread value is missing (e.g., older cached panels
-        without the `spread` column, or NaN at exit due to end-of-market
-        truncation), slippage falls back to 0 for that trade rather than
-        dropping it, so this flag is backwards-compatible with panels that
-        predate spread reconstruction.
-    """
     df = df.sort_values(["market_id", "timestamp"]).reset_index(drop=True).copy()
     df["_signal"] = _shift_signal_causally(df, signal_col) if signal_col != "unconditional" else 1.0
     df["_exit_price"] = _future_price(df, horizon_hours)
@@ -142,9 +116,6 @@ def generate_trades(
     if apply_slippage and has_spread_col:
         entry_spread = hits["spread"].astype(float).fillna(0.0).to_numpy()
         exit_spread = hits["_exit_spread"].astype(float).fillna(0.0).to_numpy()
-        # Half-spread cost on each leg: as a taker you cross from mid to the
-        # near-side quote, i.e. pay approximately half the quoted spread
-        # relative to the mid price used elsewhere in this backtest.
         slippage = shares * 0.5 * (entry_spread + exit_spread)
     else:
         slippage = np.zeros(len(hits))
@@ -192,21 +163,7 @@ def compute_risk_stats(trades: pd.DataFrame, bankroll: float = BANKROLL) -> Dict
         sharpe = mu / sigma * np.sqrt(ANNUALIZATION_DAYS) if sigma > 0 else np.nan
     else:
         mu, sigma, sharpe = np.nan, np.nan, np.nan
-
-    # Worst-day P&L replaces max_drawdown. It's the single-day loss floor
-    # in dollar terms, which IS a meaningful signal-quality diagnostic
-    # (measures downside dispersion on the daily-bucketed series) without
-    # requiring a valid portfolio-equity curve.
     worst_day = float(daily_pnl.min()) if len(daily_pnl) else np.nan
-
-    # Conventional dollar-turnover: total notional traded per day, as a
-    # percentage of bankroll. Each trade's notional is shares * entry_price
-    # for YES-side trades and shares * (1 - entry_price) for NO-side trades
-    # -- but "shares" is already computed as dollars_at_risk / cost_per_share,
-    # so shares * cost_per_share = dollars_at_risk = entry_frac * bankroll
-    # per trade. So notional per trade = entry_frac * bankroll = $1000 by
-    # default. Sum across trades / n_days / bankroll gives turnover as a
-    # fraction of bankroll per day.
     total_notional = float((tr["shares"] * np.where(
         tr["direction"] > 0, tr["entry_price"], 1.0 - tr["entry_price"]
     )).sum())
@@ -265,28 +222,6 @@ def run_full_grid(
     apply_slippage: bool = True,
     train_mask: Optional[pd.Series] = None,
 ) -> Dict[str, pd.DataFrame]:
-    """
-    Runs the full strategy x horizon grid. Returns dict with:
-      trades:    concatenated per-trade log with strategy & horizon
-      overall:   one row per (strategy, horizon) with the full risk suite
-      by_cat:    long-form (strategy, horizon, category) risk suite
-      by_period: long-form (strategy, horizon, period) risk suite
-
-    apply_slippage : bool
-        Passed through to generate_trades. See its docstring -- charges an
-        additional half-spread cost on each leg using the panel's
-        reconstructed `spread` column, on top of Kalshi's stated taker fee.
-
-    train_mask : pd.Series[bool], optional
-        Boolean mask over df's rows indicating the training portion. Used
-        to calibrate naive-strategy entry thresholds without look-ahead:
-        the 93rd-percentile threshold for mom_naive / rev_naive is
-        computed from the TRAINING signal distribution only, then frozen
-        and applied to test-period firing decisions. If None, falls back
-        to the whole-panel quantile (which leaks mildly, since the test
-        period contributes to the threshold calibration -- kept as a
-        backwards-compat default but not recommended for the headline run).
-    """
     strategies = strategies or STRATEGIES
     horizons = horizons or DEFAULT_HOLDING_HOURS
 
@@ -294,18 +229,6 @@ def run_full_grid(
     overall_rows: List[Dict] = []
     cat_rows: List[Dict] = []
     per_rows: List[Dict] = []
-
-    # Per-strategy thresholds. Vol-normalized signals are z-scores (unitless),
-    # so 1.5 sigma is a natural choice. Naive signals are RAW price differences
-    # (dollars) with typical magnitudes of ±0.02-0.10, so a fixed 1.5 threshold
-    # would filter them to zero trades.
-    #
-    # For each naive signal, set the threshold to the 93rd percentile of its
-    # absolute value. If a train_mask is provided, use ONLY the training
-    # portion of the data to compute this quantile, then freeze and apply to
-    # the whole panel (so the test-period firing decisions don't leak info
-    # about the test-period signal distribution). If no train_mask is
-    # provided, fall back to the whole-panel quantile with a warning.
     if train_mask is None:
         print("[run_full_grid] WARNING: no train_mask provided; naive "
               "thresholds calibrated on whole-panel quantile (mild leakage). "
@@ -325,11 +248,6 @@ def run_full_grid(
                 naive_thresholds[strat] = float(abs_signal.quantile(0.93))
             else:
                 naive_thresholds[strat] = entry_threshold  # fallback
-
-    # test_mask: complement of train_mask, restricts trade firing to test rows.
-    # Signals and exit-price lookups still use the full df (so lookbacks/exits
-    # can span the train/test boundary), but ENTRY decisions only happen in
-    # the test period.
     test_mask = ~train_mask if train_mask is not None else None
 
     for strat in strategies:
