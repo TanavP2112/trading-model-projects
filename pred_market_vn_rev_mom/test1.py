@@ -173,7 +173,7 @@ def evaluate_walk_forward(
     df = df.dropna(subset=["datetime"]).sort_values(["market_id", "datetime"]).reset_index(drop=True)
 
     # 2. Pre-calculate 1-bar price changes (actual_dp) vector-wide to avoid loop overhead
-    df["actual_dp"] = df.groupby("market_id")["price"].diff().shift(-1).fillna(0.0)
+    df["actual_dp"] = (df.groupby("market_id")["price"].shift(-1) - df["price"]).fillna(0.0)
 
     # 3. Try Monthly splits first; fall back to Weekly if span is short
     df["period"] = df["datetime"].dt.to_period("M")
