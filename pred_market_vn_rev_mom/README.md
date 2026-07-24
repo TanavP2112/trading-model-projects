@@ -47,12 +47,12 @@ The data was constructed from `TrevorJS/kalshi-trades` (HuggingFace), Kalshi's p
 
 Four nested specifications, following the paper's structural decomposition:
 
-| Model         | Description                                                                                                                     |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `DR`          | Deadline-resolution baseline: $$h^2 = \frac{p(1-p)}{\tau} \cdot \Delta$$ (Wright-Fisher). No fitted parameters.                 |
-| `DR-AS`       | DR + Glosten-Milgrom adverse-selection term: $$h^2 = \text{DR} + K \cdot \nu(V) \cdot \frac{s^2}{4}$$. Fits scalar `K` via OLS. |
-| `GARCH`       | Plain GARCH(1,1), no structural terms. Isolates whether structure adds value over generic clustering.                           |
-| `GARCH+DR-AS` | Full joint specification: structural terms + GARCH residual dynamics, fit jointly via QMLE.                                     |
+| Model         | Description                                                                                                                                             |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DR`          | Deadline-resolution baseline: $$h^2 = \frac{p(1-p)}{\tau} \cdot \Delta$$ (Wright-Fisher). No fitted parameters.                                         |
+| `DR-AS`       | DR + Glosten-Milgrom adverse-selection term: $$h^2 = \text{DR} + K \cdot \nu(V) \cdot \frac{s^2}{4}$$. Fits scalar `K` via a method of moments estimate |
+| `GARCH`       | Plain GARCH(1,1), no structural terms. Isolates whether structure adds value over generic clustering.                                                   |
+| `GARCH+DR-AS` | Full joint specification: structural terms + GARCH residual dynamics, fit jointly via QMLE.                                                             |
 
 **Estimation:** All models fit via **Gaussian quasi-maximum likelihood (QMLE)**.
 
