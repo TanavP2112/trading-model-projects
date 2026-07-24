@@ -58,7 +58,7 @@ Four nested specifications, following the paper's structural decomposition:
 
 $$\widehat{\theta}_m \in \arg\min_{\theta} \sum_{i \in \mathcal{T}_m^{\text{train}}} V_i \left\lbrace \log h_i^2(\theta) + \frac{\varepsilon_i^2}{h_i^2(\theta)} \right\rbrace$$
 
-**Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar $$\abs{\delta{p}}$$ has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
+**Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar $$\lvert\Delta{p}\rvert$$ has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
 
 **Evaluation:** Monthly expanding walk-forward. Following the paper's "Analysis filtering" convention, retain contracts with ≥48 hourly observations and filter to active bars (`|ε| > 1e-10`) at evaluation time.
 
