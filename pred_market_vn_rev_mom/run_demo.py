@@ -265,7 +265,7 @@ def main():
         print("  rather than a stable per-fold edge -- event-concentration pattern.")
     os.makedirs(args.out_dir, exist_ok=True)
     if not results["overall"].empty:
-        results["overall"].to_csv(f"{args.out_dir}/'phase2_overall.csv", index=False)
+        results["overall"].to_csv(f"{args.out_dir}/phase2_overall.csv", index=False)
         results["by_period"].to_csv(f"{args.out_dir}/phase2_by_period.csv", index=False)
         if not results["by_cat"].empty:
             results["by_cat"].to_csv(f"{args.out_dir}/phase2_by_category.csv", index=False)
