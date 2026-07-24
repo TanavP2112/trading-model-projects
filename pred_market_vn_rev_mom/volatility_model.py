@@ -60,7 +60,7 @@ def fit_K(
     bar_length: float = DEFAULT_BAR_LENGTH
 ) -> float:
     """
-    Fit AS scale parameter K via a closed-form approach on active-update bars:
+    Fit AS scale parameter K via a mle approach on active-update bars:
         (Δp)^2 - DR ≈ K * [nu(V) * s^2/4]
     """
     from scipy.optimize import minimize
