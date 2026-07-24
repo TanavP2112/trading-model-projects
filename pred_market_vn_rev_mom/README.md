@@ -54,7 +54,7 @@ Four nested specifications, following the paper's structural decomposition:
 | `GARCH`       | Plain GARCH(1,1), no structural terms. Isolates whether structure adds value over generic clustering. |
 | `GARCH+DR-AS` | Full joint specification: structural terms + GARCH residual dynamics, fit jointly via QMLE.           |
 
-**Estimation:** All models fit via **Gaussian quasi-maximum likelihood (QMLE)**, matching the original paper (Appendix B, eq. 17) and Bollerslev & Wooldridge (1992), which is also used in the volatility paper.
+**Estimation:** All models fit via **Gaussian quasi-maximum likelihood (QMLE)**.
 
 $$\widehat{\theta}_m \in \arg\min_{\theta} \sum\_{i \in \mathcal{T}\_m^{\text{train}}} V_i \left\{ \log h_i^2(\theta) + \frac{\varepsilon_i^2}{h_i^2(\theta)} \right\}$$
 
