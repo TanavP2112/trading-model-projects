@@ -54,35 +54,6 @@ def build_panel_from_hf_dataset(
     ewma_alpha: float = 0.3,
     output_path: str = "data/kalshi_hf_panel.parquet",
 ) -> pd.DataFrame:
-    """Build hourly panel from Kalshi trade data with optional per-hour
-    spread reconstruction from trade aggressor pattern.
-
-    Parameters
-    ----------
-    reconstruct_spread : bool
-        If True (default), compute per-hour effective spread from taker_side
-        aggressor pattern:
-            spread = min(price where taker='yes') - max(price where taker='no')
-        With rolling-24h market-specific median fallback for hours with
-        insufficient two-sided flow, EWMA smoothing (alpha=ewma_alpha),
-        and a floor at 0.01 (Kalshi's minimum tick).
-
-        If False, uses a constant 0.01 spread placeholder (original behavior).
-
-    ewma_alpha : float
-        EWMA smoothing parameter for the reconstructed spread series per
-        market. Higher = less smoothing.
-
-    Notes on the reconstruction
-    ---------------------------
-    This yields the EFFECTIVE spread (from realized trades), NOT the QUOTED
-    spread (from close-of-hour order book snapshots) used by Xi et al. (2026).
-    The paper's DR-AS specification is identified against quoted spread
-    variation; this reconstruction identifies against effective spread
-    variation. Related but not identical microstructure quantities --
-    effective spread is generally narrower than quoted, since trades often
-    execute inside the quote.
-    """
     print(f"[Info] Downloading/verifying dataset files locally for '{repo_id}'...")
 
     # 1. Download parquet files to HF local cache
