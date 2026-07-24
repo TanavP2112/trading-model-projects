@@ -1,8 +1,4 @@
 """
-Structural volatility model for binary prediction markets, implementing the
-DR-AS specification from Xi, Moallemi, Pai & Wang, "Volatility in Prediction
-Markets: A Structural Approach" (arXiv:2607.08199, 2026).
-
 One-step conditional variance is decomposed into two additive channels:
     h^2 = p(1-p)/tau + K * nu(V) * s^2/4
 """
