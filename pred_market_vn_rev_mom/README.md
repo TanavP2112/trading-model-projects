@@ -58,7 +58,9 @@ Four nested specifications, following the paper's structural decomposition:
 
 $$\widehat{\theta}_m \in \arg\min_{\theta} \sum_{i \in \mathcal{T}_m^{\text{train}}} V_i \left\lbrace \log h_i^2(\theta) + \frac{\varepsilon_i^2}{h_i^2(\theta)} \right\rbrace$$
 
-I want to discuss a little bit about why the paper decided to use QMLE as an estimator for the GARCH (and subsequent) models. In general, normal volatility forecasting models (ARCH AND GARCH) are meant for financial return series. As such, you would typically test for stationarity via the Augmented Dickey-Fuller (ADF) Test. However, Gaussian QMLE is very robust. The conditions are as follows:
+I want to discuss a little bit about why the paper decided to use QMLE as an estimator for the GARCH (and subsequent) models. In general, normal volatility forecasting models (ARCH AND GARCH) are meant for asset return series. As such, you would typically test for stationarity via the Augmented Dickey-Fuller (ADF) Test.
+
+However, Kalshi contracts generate price innovations that are fundamentally different because they represent binary probabilities strictly bounded between \([0, 1]\). Because of these strict bounds, the conditional distribution of the innovations (\(z*{t}\)) is highly non-Gaussian, displaying heavy non-linearities and bounded support. This is where the robustness of Gaussian QMLE becomes essential. Under QMLE, even if the true conditional distribution of \(z*{t}\) is non-normal, the parameter estimates remain consistent and asymptotically normal:\(\^{\theta }_{M}\xrightarrow{p}\theta _{0}\quad \text{as}\quad T\rightarrow \infty \)
 
 Let $$y_t$$ represent the price model innovations of a prediction market contract at time $$t$$. The conditional mean and variance are
 
@@ -76,7 +78,7 @@ to summarize the proofs for QMLE, $$\hat{\theta_M} \xrightarrow{p} \theta_0$$ as
 
 $$\therefore \sqrt{T}(\hat{\theta_M} - \theta_0) \xrightarrow{d}\mathcal{N}(0, \mathbf{A^{-1}BA^{-1}})$$
 
-And this condition holds no matter if $$\alpha + \beta < 1$$, $$\alpha + \beta = 1$$, or $$\alpha + \beta > 1$$
+This asymptotic normality relies on the robust "sandwich" covariance matrix estimator. However, this property still requires the underlying process to be strictly stationary ($$E[\ln(\alpha z_t^2 + \beta)] < 0$$), meaning we cannot arbitrarily ignore the parameter constraints. QMLE is chosen not because it allows for explosive variance ($$\alpha + \beta > 1$$), but because it correctly estimates standard errors when the \([0,1]\) boundaries force the residuals to be heavily non-Gaussian
 
 **Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar $$\lvert\Delta{p}\rvert$$ has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
 
