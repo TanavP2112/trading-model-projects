@@ -76,7 +76,7 @@ $$\alpha + \beta < 1$$
 However, this changes for Gaussian QMLE. We let $$\theta_0 = (\omega_0,\alpha_0, \beta_0)$$ represent the true parameters
 to summarize the proofs for QMLE, $$\hat{\theta_M} \xrightarrow{p} \theta_0$$ as $$T \xrightarrow{} \inf$$
 
-$$\therefore \sqrt{T}(\hat{\theta_M} - \theta_0) \xrightarrow{d}\mathcal{N}(0, \mathbf{A^{-1}BA^{-1}})$$
+$$\therefore \quad \sqrt{T}(\hat{\theta_M} - \theta_0) \xrightarrow{d}\mathcal{N}(0, \mathbf{A^{-1}BA^{-1}})$$
 
 This asymptotic normality relies on the robust "sandwich" covariance matrix estimator. However, this property still requires the underlying process to be strictly stationary ($$E[\ln(\alpha z_t^2 + \beta)] < 0$$), meaning we cannot arbitrarily ignore the parameter constraints. QMLE is chosen not because it allows for explosive variance ($$\alpha + \beta > 1$$), but because it correctly estimates standard errors when the \([0,1]\) boundaries force the residuals to be heavily non-Gaussian
 
