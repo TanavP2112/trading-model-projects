@@ -74,7 +74,7 @@ Typically, for standard financial models, the condition for covariance stationar
 $$\alpha + \beta < 1$$
 
 However, this changes for Gaussian QMLE. We let $$\theta_0 = (\omega_0,\alpha_0, \beta_0)$$ represent the true parameters
-to summarize the proofs for QMLE, $$\hat{\theta_M} \xrightarrow{p} \theta_0$$ as $$T \xrightarrow{} \inf$$
+to summarize the proofs for QMLE, $$\hat{\theta_M} \xrightarrow{p} \theta_0$$ as $$T \xrightarrow{} \infty$$
 
 $$\therefore \quad \sqrt{T}(\hat{\theta_M} - \theta_0) \xrightarrow{d}\mathcal{N}(0, \mathbf{A^{-1}BA^{-1}})$$
 
