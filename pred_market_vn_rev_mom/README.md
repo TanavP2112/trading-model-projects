@@ -58,6 +58,13 @@ Four nested specifications, following the paper's structural decomposition:
 
 $$\widehat{\theta}_m \in \arg\min_{\theta} \sum_{i \in \mathcal{T}_m^{\text{train}}} V_i \left\lbrace \log h_i^2(\theta) + \frac{\varepsilon_i^2}{h_i^2(\theta)} \right\rbrace$$
 
+I want to discuss a little bit about why the paper decided to use QMLE as an estimator for the GARCH (and subsequent) models. In general, normal volatility forecasting models (ARCH AND GARCH) are meant for financial return series. As such, you would typically test for stationarity via the Augmented Dickey-Fuller (ADF) Test. However, with the specifications described in the paper, this changes to a binary $$[0, 1]$$ bounded probability, and a property of all Kalshi contracts. On top of that, Gaussian QMLE is very robust. The conditions are as follows:
+
+Let $$y_t$$ represent the price model innovations of a prediction market contract at time $$t$$. The conditional mean and variance are
+
+$$y_t = \sigma \cdot z_t$$
+$$\sigma^2_t = \omega + \alpha y^2 + \beta\sigma^2_{t-1}$$
+
 **Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar $$\lvert\Delta{p}\rvert$$ has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
 
 **Evaluation:** Monthly expanding walk-forward. Following the paper's "Analysis filtering" convention, retain contracts with ≥48 hourly observations and filter to active bars (`|ε| > 1e-10`) at evaluation time.
