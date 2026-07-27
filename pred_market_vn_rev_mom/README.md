@@ -82,6 +82,9 @@ This asymptotic normality is preserved by the robust Huber-White "sandwich" cova
 
 **Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar $$\lvert\Delta{p}\rvert$$ has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
 
+These empirical intervals are then evaluated out-of-sample using the Winkler interval score at the 95% confidence level ($$\alpha = 0.05$$)
+$$\text{Score}=(U-L)+40(L-x)\mathbb{I}(x<L)+40(x-U)\mathbb{I}(x>U)$$
+
 **Evaluation:** Monthly expanding walk-forward. Following the paper's "Analysis filtering" convention, retain contracts with ≥48 hourly observations and filter to active bars (`|ε| > 1e-10`) at evaluation time.
 
 ### Phase 2: Trading signals
