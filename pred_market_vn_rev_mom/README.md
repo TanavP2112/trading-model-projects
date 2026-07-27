@@ -58,7 +58,7 @@ Four nested specifications, following the paper's structural decomposition:
 
 $$\widehat{\theta}_m \in \arg\min_{\theta} \sum_{i \in \mathcal{T}_m^{\text{train}}} V_i \left\lbrace \log h_i^2(\theta) + \frac{\varepsilon_i^2}{h_i^2(\theta)} \right\rbrace$$
 
-I want to discuss a little bit about why the paper decided to use QMLE as an estimator for the GARCH (and subsequent) models. In general, normal volatility forecasting models (ARCH AND GARCH) are meant for financial return series. As such, you would typically test for stationarity via the Augmented Dickey-Fuller (ADF) Test. However, with the specifications described in the paper, this changes to a binary $$[0, 1]$$ bounded probability, and a property of all Kalshi contracts. On top of that, Gaussian QMLE is very robust. The conditions are as follows:
+I want to discuss a little bit about why the paper decided to use QMLE as an estimator for the GARCH (and subsequent) models. In general, normal volatility forecasting models (ARCH AND GARCH) are meant for financial return series. As such, you would typically test for stationarity via the Augmented Dickey-Fuller (ADF) Test. However, Gaussian QMLE is very robust. The conditions are as follows:
 
 Let $$y_t$$ represent the price model innovations of a prediction market contract at time $$t$$. The conditional mean and variance are
 
@@ -72,7 +72,11 @@ Typically, for standard financial models, the condition for covariance stationar
 $$\alpha + \beta < 1$$
 
 However, this changes for Gaussian QMLE. We let $$\theta_0 = (\omega_0,\alpha_0, \beta_0)$$ represent the true parameters
-to summarize the proofs for QMLE, $$\hat{\theta} \xrightarrow{p} \theta_0 as T \xrightarrow \infinity$$
+to summarize the proofs for QMLE, $$\hat{\theta_M} \xrightarrow{p} \theta_0$$ as $$T \xrightarrow \infinity$$
+
+$$\therefore \sqrt{T}(\hat{\theta_M} - \theta_0) \xrightarrow{d}\mathcal{N}(0, \mathbf{A^{-1}BA^{-1}})$$
+
+And this condition holds no matter if $$\alpha + \beta < 1$$, $$\alpha + \beta = 1$$, or $$\alpha + \beta > 1$$
 
 **Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar $$\lvert\Delta{p}\rvert$$ has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
 
