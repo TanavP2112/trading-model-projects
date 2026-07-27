@@ -71,7 +71,7 @@ Typically, for standard financial models, the condition for covariance stationar
 
 $$\alpha + \beta < 1$$
 
-However, this changes for Gaussian QMLE. We let $$\theta_0 = (\omega_0,\alpha_0, \beta_0) represent the true parameters$$
+However, this changes for Gaussian QMLE. We let $$\theta_0 = (\omega_0,\alpha_0, \beta_0)$$ represent the true parameters
 to summarize the proofs for QMLE, $$\hat{\theta} \xrightarrow{p} \theta_0 as T \xrightarrow \infinity$$
 
 **Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar $$\lvert\Delta{p}\rvert$$ has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
