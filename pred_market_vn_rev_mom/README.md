@@ -65,6 +65,8 @@ Let $$y_t$$ represent the price model innovations of a prediction market contrac
 $$y_t = \sigma \cdot z_t$$
 $$\sigma^2_t = \omega + \alpha y^2_{t-1} + \beta\sigma^2_{t-1}$$
 
+where an $$z_t$$ is iid. innovation with $$\mathbb{E}[z_t] = 0 and \mathbb{E}[z_^2_t] = 1$$
+
 **Interval construction:** Rather than parametric Gaussian intervals, we build **asymmetric empirical intervals** from the 2.5%/97.5% quantiles of standardized training residuals per model per fold. This is a legitimate extension the paper's own framing allows — since Appendix B states that "the interval-score evaluation does not require Gaussian standardized innovations" — and is motivated by measured heavy tails in Kalshi returns (active-bar $$\lvert\Delta{p}\rvert$$ has a very VERY large p99/median ratio (~18x) compared to the expectations of Gaussian (which is ~3.8x)).
 
 **Evaluation:** Monthly expanding walk-forward. Following the paper's "Analysis filtering" convention, retain contracts with ≥48 hourly observations and filter to active bars (`|ε| > 1e-10`) at evaluation time.
